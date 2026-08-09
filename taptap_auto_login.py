@@ -1014,6 +1014,15 @@ def is_qq_authorization_page(elements) -> bool:
     return any(elem.text and any(marker in elem.text for marker in markers) for elem in elements)
 
 
+def is_taptap_social_agreement_dialog(elements) -> bool:
+    """识别点击社交登录后出现的 TapTap 服务协议确认弹窗。"""
+    title = _find_element_by_id_candidates(elements, ["dialog_title"])
+    agree = _find_element_by_id_candidates(elements, ["dialog_btn_right"])
+    return title is not None and agree is not None and any(
+        marker in (agree.text or "") for marker in ("同意", "继续")
+    )
+
+
 def is_country_list_page(elements) -> bool:
     area_rows = [
         elem for elem in elements
@@ -1257,15 +1266,47 @@ def perform_qq_login(login_elements) -> bool:
 
     next_elements = wait_for_ui_condition(
         lambda items: (
-            is_vivo_instance_chooser(items)
+            is_taptap_social_agreement_dialog(items)
+            or is_vivo_instance_chooser(items)
             or is_qq_authorization_page(items)
             or is_home_or_profile_page(items)
         ),
         timeout=5,
     )
     if next_elements is None:
-        print("    [FAIL] 点击 QQ 图标后未出现应用选择或 QQ 授权页面")
+        print("    [FAIL] 点击 QQ 图标后未出现协议弹窗、应用选择或 QQ 授权页面")
         return False
+
+    if is_taptap_social_agreement_dialog(next_elements):
+        print("\n[QQ-1.5] 处理 TapTap 服务协议弹窗...")
+        agreement_elements = (
+            log_global_ui_elements("QQ-1.5 点击同意并继续前")
+            or next_elements
+        )
+        agree_continue = _find_element_by_id_candidates(
+            agreement_elements,
+            ["dialog_btn_right"],
+        )
+        if agree_continue is None:
+            print("    [FAIL] 协议弹窗未找到“同意并继续”按钮")
+            return False
+        print(f"    找到协议按钮: {_elem_desc(agree_continue)}")
+        _tap_elem(agree_continue, "同意并继续")
+        next_elements = wait_for_ui_condition(
+            lambda items: (
+                not is_taptap_social_agreement_dialog(items)
+                and (
+                    is_vivo_instance_chooser(items)
+                    or is_qq_authorization_page(items)
+                    or is_home_or_profile_page(items)
+                )
+            ),
+            timeout=6,
+        )
+        if next_elements is None:
+            print("    [FAIL] 点击“同意并继续”后未进入应用选择或 QQ 授权页面")
+            return False
+        print("    [OK] TapTap 服务协议弹窗已消失")
 
     if is_vivo_instance_chooser(next_elements):
         print("\n[QQ-2] 处理“选择要使用的应用”弹窗...")
