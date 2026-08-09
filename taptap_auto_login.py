@@ -676,14 +676,20 @@ def find_agreement_radio_element(elements):
 
 
 def find_agreement_control_element(elements):
-    """查找协议控件；兼容 UIAutomator 只暴露 protocol TextView 的版本。"""
+    """查找协议点击目标，优先使用 checkbox 图标而非协议链接文字。"""
     radio = find_agreement_radio_element(elements)
     if radio is not None:
         return radio
 
-    protocol = _find_element_by_id_candidates(elements, ["protocol"])
-    if protocol is not None:
-        return protocol
+    control = _find_element_by_id_candidates(elements, [
+        "checkbox",
+        "click_space",
+        "protocol",
+        "protocolV2",
+        "protocol_back",
+    ])
+    if control is not None:
+        return control
 
     return next(
         (
@@ -698,13 +704,22 @@ def find_agreement_control_element(elements):
 
 
 def tap_agreement_control(elem):
-    """点击协议 RadioButton；自定义控件只暴露文本时点击文本左侧圆点。"""
+    """点击协议控件；优先精确点击 checkbox，自定义布局则点击左侧圆点。"""
+    resource_id = elem.resource_id or ""
     if "RadioButton" in (elem.class_name or ""):
         _tap_elem(elem, "协议 RadioButton")
         return
+    if resource_id.endswith(":id/checkbox"):
+        _tap_elem(elem, "协议 checkbox 图标")
+        return
 
     x1, y1, _, y2 = elem.rect
-    indicator_x = max(1, x1 - 40)
+    if resource_id.endswith(":id/click_space") \
+            or resource_id.endswith(":id/protocolV2") \
+            or resource_id.endswith(":id/protocol_back"):
+        indicator_x = x1 + 42
+    else:
+        indicator_x = max(1, x1 - 40)
     indicator_y = (y1 + y2) // 2
     _tap_xy(indicator_x, indicator_y, "协议 RadioButton 左侧圆点")
 
@@ -1713,7 +1728,7 @@ def main():
         print(f"      → 协议区域: {_elem_desc(agreement_control)}")
         tap_agreement_control(agreement_control)
         agreement_ready = True
-        print("    [ACTION] 已点击 protocol 文本左侧圆点，等待登录跳转验证勾选结果")
+        print("    [ACTION] 已点击协议 checkbox 区域，等待登录跳转验证勾选结果")
         break
 
     if not agreement_ready:
