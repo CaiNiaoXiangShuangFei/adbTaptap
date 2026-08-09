@@ -93,6 +93,18 @@ def adb(*args, timeout=10):
         return None
 
 
+def adb_bytes(*args, timeout=10):
+    """执行 adb 并保留原始字节，供 UTF-8 XML、PNG 等内容使用。"""
+    try:
+        return subprocess.run(
+            [ADB_PATH, *map(str, args)],
+            capture_output=True,
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+
+
 def adb_text(*args, timeout=10) -> str:
     r = adb(*args, timeout=timeout)
     return (r.stdout + r.stderr) if r else ""
@@ -602,20 +614,26 @@ def api_dump_ui_elements(serial: str) -> dict:
             if dump_result:
                 message = ((dump_result.stdout or "") + (dump_result.stderr or "")).strip()
             return {"ok": False, "message": "页面元素获取失败: " + (message or "设备无响应")}
-        xml_result = adb("-s", serial, "exec-out", "cat", remote_path, timeout=12)
+        # uiautomator XML 固定为 UTF-8；必须保留原始字节，不能用 Windows 默认编码解码。
+        xml_result = adb_bytes("-s", serial, "exec-out", "cat", remote_path, timeout=12)
         if not xml_result or xml_result.returncode != 0:
             message = ""
             if xml_result:
-                message = ((xml_result.stdout or "") + (xml_result.stderr or "")).strip()
+                error_bytes = (xml_result.stdout or b"") + (xml_result.stderr or b"")
+                message = error_bytes.decode("utf-8", errors="replace").strip()
             return {"ok": False, "message": "UI XML 读取失败: " + (message or "设备无响应")}
 
-        xml_text = (xml_result.stdout or "").strip()
-        xml_start = xml_text.find("<hierarchy")
-        declaration_start = xml_text.find("<?xml")
+        xml_bytes = (xml_result.stdout or b"").strip()
+        declaration_start = xml_bytes.find(b"<?xml")
+        xml_start = xml_bytes.find(b"<hierarchy")
         if declaration_start >= 0:
-            xml_text = xml_text[declaration_start:]
+            xml_bytes = xml_bytes[declaration_start:]
         elif xml_start >= 0:
-            xml_text = xml_text[xml_start:]
+            xml_bytes = xml_bytes[xml_start:]
+        try:
+            xml_text = xml_bytes.decode("utf-8-sig", errors="strict")
+        except UnicodeDecodeError as exc:
+            return {"ok": False, "message": f"UI XML UTF-8 解码失败: {exc}"}
         try:
             root = ET.fromstring(xml_text)
         except ET.ParseError as exc:
