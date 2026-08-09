@@ -1638,22 +1638,25 @@ def run_qq_game_download_flow() -> bool:
         print("    [FAIL] 游戏详情页未找到下载按钮")
         return False
     _tap_elem(download_button, "下载")
-    started_elements = wait_for_ui_condition(download_has_started, timeout=3)
+    download_clicked_at = time.monotonic()
+    target_delay = random.uniform(1.0, 2.0)
+    started_elements = wait_for_ui_condition(download_has_started, timeout=1.5)
     if started_elements is None:
         print("    [FAIL] 下载按钮点击后状态没有变化")
         return False
     print("    [OK] 下载已开始")
-    if not pause_active_download(started_elements):
-        return False
+    remaining_delay = target_delay - (time.monotonic() - download_clicked_at)
+    if remaining_delay > 0:
+        print(f"    [INFO] 补足下载后等待时间 {remaining_delay:.1f} 秒...")
+        time.sleep(remaining_delay)
+    print(f"    [INFO] 下载点击约 {time.monotonic() - download_clicked_at:.1f} 秒后结束当前轮")
 
     if ARGS.capture_screenshot:
-        delay_seconds = random.uniform(1.0, 2.0)
-        print(f"    [INFO] 已启用结果截图，等待 {delay_seconds:.1f} 秒...")
-        time.sleep(delay_seconds)
+        print("    [INFO] 已启用结果截图，正在进入“我的游戏”...")
         if not navigate_to_my_games() or not save_my_games_screenshot():
             return False
     else:
-        print("    [INFO] 未启用结果截图，直接完成当前 QQ 账号流程")
+        print("    [INFO] 当前 QQ 流程完成，下一轮将立即清除 TapTap 数据")
     return True
 
 
@@ -1689,57 +1692,6 @@ def download_has_started(elements) -> bool:
         ))
         for elem in elements
     )
-
-
-def _repair_mojibake_ui_text(text: str) -> str:
-    """兼容部分游戏详情文本被 GBK 字节按 Latin-1 展示的情况。"""
-    value = str(text or "")
-    try:
-        repaired = value.encode("latin-1").decode("gbk")
-        return repaired if repaired else value
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        return value
-
-
-def download_is_paused(elements) -> bool:
-    paused_markers = ("暂停中", "已暂停", "继续下载")
-    return any(
-        any(marker in _repair_mojibake_ui_text(elem.text) for marker in paused_markers)
-        for elem in elements
-        if elem.text
-    )
-
-
-def pause_active_download(elements=None) -> bool:
-    """点击详情页下载操作键并确认任务进入暂停状态。"""
-    current_elements = elements or get_ui_elements_safe(DEVICE_ID)
-    if download_is_paused(current_elements):
-        print("    [OK] 下载已经处于暂停状态")
-        return True
-
-    pause_button = _find_element_by_id_candidates(current_elements, [
-        "btn_action",
-        "download_pause",
-        "pause_button",
-    ])
-    if pause_button is None:
-        # 兼容未拆分 btn_action 的旧版详情页。
-        pause_button = _find_element_by_id_candidates(current_elements, [
-            "expanded_local_button",
-            "btn_container",
-        ])
-    if pause_button is None:
-        print("    [FAIL] 下载开始后未找到暂停操作按钮")
-        return False
-
-    _tap_elem(pause_button, "暂停下载")
-    log_global_ui_elements("下载开始后点击暂停前", current_elements)
-    paused_elements = wait_for_ui_condition(download_is_paused, timeout=3)
-    if paused_elements is None:
-        print("    [FAIL] 点击暂停后未检测到“暂停中”状态")
-        return False
-    print("    [OK] 下载已暂停")
-    return True
 
 
 def find_and_tap_safe(text: str = None, desc: str = None, res_id: str = None,
@@ -2084,8 +2036,8 @@ class PopupMonitor:
 
     def stop(self):
         self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=3)
+        # 监控线程是 daemon；这里只发出停止信号，不等待可能正在进行的 UI dump，
+        # 避免当前轮结束后额外阻塞最多 3 秒，影响下一轮清数据。
         print("    [OK] 弹窗监控已停止")
 
     def _run(self):
@@ -3068,27 +3020,30 @@ def main():
         print("    [FAIL] 未找到下载按钮")
         return
 
-    started_elements = wait_for_ui_condition(download_has_started, timeout=3)
+    download_clicked_at = time.monotonic()
+    target_delay = random.uniform(1.0, 2.0)
+    started_elements = wait_for_ui_condition(download_has_started, timeout=1.5)
     if started_elements is None:
         print("    [FAIL] 第 17 步未通过验证：下载状态没有发生变化")
         return
     print("    [OK] 下载点击已生效，已检测到下载/安装状态")
-    if not pause_active_download(started_elements):
-        return
+    remaining_delay = target_delay - (time.monotonic() - download_clicked_at)
+    if remaining_delay > 0:
+        print(f"    [INFO] 补足下载后等待时间 {remaining_delay:.1f} 秒...")
+        time.sleep(remaining_delay)
+    print(f"    [INFO] 下载点击约 {time.monotonic() - download_clicked_at:.1f} 秒后结束当前账号")
 
     if not ARGS.install_and_launch:
         screenshot_path = ""
         if ARGS.capture_screenshot:
-            delay_seconds = random.uniform(1.0, 2.0)
-            print(f"    [INFO] 已启用结果截图，等待 {delay_seconds:.1f} 秒后返回首页...")
-            time.sleep(delay_seconds)
+            print("    [INFO] 已启用结果截图，正在返回首页...")
             if not navigate_to_my_games():
                 return
             screenshot_path = save_my_games_screenshot()
             if not screenshot_path:
                 return
         else:
-            print("    [INFO] 未启用结果截图，下载开始后直接完成当前账号")
+            print("    [INFO] 当前账号完成，下一个账号将立即清除 TapTap 数据")
         _log("\n" + "=" * 60)
         if screenshot_path:
             _log(f"当前账号流程完成，结果截图: {screenshot_path}")

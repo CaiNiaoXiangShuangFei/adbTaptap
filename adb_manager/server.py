@@ -880,6 +880,8 @@ def _run_device_queue(task: dict, account_ids: list[str], settings: dict) -> Non
             completed += 1
             _mark_account_finished(account_id, serial, True)
             _append_task_line(task, f"[系统] 账号完成并自动取消勾选: {record['phone']}")
+            if queue_index < len(account_ids):
+                _append_task_line(task, "[系统] 立即开始下一个账号；新流程第 1 步将清除 TapTap 数据")
         else:
             failures += 1
             reason = "用户停止任务" if stopped else f"任务退出码 {return_code}"
@@ -997,10 +999,13 @@ def _run_qq_device_task(task: dict, settings: dict) -> None:
 
         if cycle_succeeded:
             completed_cycles += 1
-            _append_task_line(
-                task,
-                f"[系统] QQ 已完成 {completed_cycles}/{target_cycles} 次",
-            )
+            if completed_cycles < target_cycles:
+                _append_task_line(
+                    task,
+                    f"[系统] QQ 已完成 {completed_cycles}/{target_cycles} 次，立即开始下一轮并清除 TapTap 数据",
+                )
+            else:
+                _append_task_line(task, f"[系统] QQ 已完成 {completed_cycles}/{target_cycles} 次")
         elif not stopped:
             failed_cycles += 1
             _append_task_line(
