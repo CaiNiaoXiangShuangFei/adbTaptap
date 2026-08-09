@@ -913,7 +913,7 @@ def _run_device_queue(task: dict, account_ids: list[str], settings: dict) -> Non
     _append_task_line(task, "=" * 60)
 
 
-def _run_qq_device_task(task: dict, settings: dict) -> None:
+def _run_qq_device_task_once(task: dict, settings: dict) -> bool:
     """QQ 流程每台设备只执行一次，不占用手机号账号队列。"""
     serial = task["serial"]
     _append_task_line(task, "=" * 60)
@@ -924,8 +924,7 @@ def _run_qq_device_task(task: dict, settings: dict) -> None:
         f"[系统] 结果截图: {'启用' if settings.get('capture_screenshot') else '未启用'}",
     )
     with _TASK_LOCK:
-        task["progress"] = 1
-        task["current_phone"] = "QQ"
+        task["current_phone"] = task.get("current_phone") or "QQ"
     try:
         command = build_task_command(serial, settings, None)
         env = dict(os.environ)
@@ -959,14 +958,69 @@ def _run_qq_device_task(task: dict, settings: dict) -> None:
     success = return_code == 0 and not stopped
     with _TASK_LOCK:
         task["current_phone"] = ""
-        task["completed"] = 1 if success else 0
-        task["failures"] = 0 if success else 1
-        task["status"] = "stopped" if stopped else "success" if success else "partial"
     if success:
         _append_task_line(task, "[系统] QQ 号全流程完成")
     else:
         reason = "用户停止任务" if stopped else f"任务退出码 {return_code}"
         _append_task_line(task, f"[系统] QQ 号全流程未完成: {reason}")
+    _append_task_line(task, "=" * 60)
+    return success
+
+
+def _run_qq_device_task(task: dict, settings: dict) -> None:
+    """持续执行 QQ 全流程；每轮完成后立即启动下一轮，直到用户停止。"""
+    completed_cycles = 0
+    failed_cycles = 0
+    cycle = 0
+    _append_task_line(task, "=" * 60)
+    _append_task_line(task, f"[系统] QQ 循环任务启动: {task['serial']} | 将持续运行直到手动停止")
+
+    while not task["stop_event"].is_set():
+        cycle += 1
+        with _TASK_LOCK:
+            task["status"] = "running"
+            task["progress"] = cycle
+            task["current_phone"] = f"QQ 第 {cycle} 轮"
+        _append_task_line(task, f"[系统] 开始 QQ 全流程第 {cycle} 轮")
+
+        cycle_succeeded = _run_qq_device_task_once(task, settings)
+        stopped = task["stop_event"].is_set()
+        cycle_succeeded = cycle_succeeded and not stopped
+
+        if cycle_succeeded:
+            completed_cycles += 1
+            _append_task_line(
+                task,
+                f"[系统] QQ 第 {cycle} 轮完成，即将清除 TapTap 数据并开始下一轮",
+            )
+        elif not stopped:
+            failed_cycles += 1
+            _append_task_line(
+                task,
+                f"[系统] QQ 第 {cycle} 轮失败，2 秒后重新清除数据并重试",
+            )
+
+        with _TASK_LOCK:
+            task["progress"] = cycle
+            task["completed"] = completed_cycles
+            task["failures"] = failed_cycles
+            task["current_phone"] = ""
+            task["status"] = "stopped" if stopped else "running"
+
+        if stopped:
+            break
+        if not cycle_succeeded and task["stop_event"].wait(2.0):
+            break
+
+    with _TASK_LOCK:
+        task["current_phone"] = ""
+        task["completed"] = completed_cycles
+        task["failures"] = failed_cycles
+        task["status"] = "stopped"
+    _append_task_line(
+        task,
+        f"[系统] QQ 循环任务已停止: 完成 {completed_cycles} 轮，失败 {failed_cycles} 轮",
+    )
     _append_task_line(task, "=" * 60)
 
 
@@ -995,7 +1049,7 @@ def _start_qq_device_tasks(requested: list[str], settings: dict) -> dict:
                 "current_account_id": None,
                 "current_phone": "",
                 "progress": 0,
-                "total": 1,
+                "total": "∞",
                 "completed": 0,
                 "failures": 0,
                 "account_ids": [],
@@ -1015,7 +1069,7 @@ def _start_qq_device_tasks(requested: list[str], settings: dict) -> dict:
         "ok": True,
         "batch_id": batch_id,
         "serials": list(requested),
-        "message": f"已在 {len(requested)} 台设备启动 QQ 号全流程",
+        "message": f"已在 {len(requested)} 台设备启动 QQ 号循环全流程（手动停止前持续运行）",
     }
 
 
@@ -1025,7 +1079,7 @@ def api_task_run(
     flow_type: str = "new_account",
     capture_result_screenshot: bool = False,
 ) -> dict:
-    """启动所选流程：新号按账号队列运行，QQ 号按设备各运行一次。"""
+    """启动所选流程：新号按账号队列运行，QQ 号按设备持续循环。"""
     if not os.path.isfile(TAPTAP_SCRIPT):
         return {"ok": False, "message": f"找不到脚本: {TAPTAP_SCRIPT}"}
     game_name = str(game_name or "").strip()

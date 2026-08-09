@@ -383,21 +383,22 @@ def get_ui_elements_safe(device_id, *, background: bool = False) -> list:
         _UI_DUMP_LOCK.release()
 
 
-def log_global_ui_elements(step_label: str) -> list:
+def log_global_ui_elements(step_label: str, elements=None) -> list:
     """获取当前全局 UI 元素，并以 JSON Lines 形式保存到本地运行日志。"""
     captured_at = datetime.now().isoformat(timespec="milliseconds")
     begin_marker = f"[UI-ELEMENTS-BEGIN] step={step_label} captured_at={captured_at}"
     _write_log_file(begin_marker)
-    try:
-        elements = get_ui_elements_safe(DEVICE_ID)
-    except Exception as exc:
-        _write_log_file(
-            f"[UI-ELEMENTS-ERROR] step={step_label} "
-            f"error={type(exc).__name__}: {exc}"
-        )
-        _write_log_file(f"[UI-ELEMENTS-END] step={step_label} count=0")
-        _log(f"    [WARN] 第 {step_label} 步全局元素获取失败，详情已写入日志")
-        return []
+    if elements is None:
+        try:
+            elements = get_ui_elements_safe(DEVICE_ID)
+        except Exception as exc:
+            _write_log_file(
+                f"[UI-ELEMENTS-ERROR] step={step_label} "
+                f"error={type(exc).__name__}: {exc}"
+            )
+            _write_log_file(f"[UI-ELEMENTS-END] step={step_label} count=0")
+            _log(f"    [WARN] 第 {step_label} 步全局元素获取失败，详情已写入日志")
+            return []
 
     for index, elem in enumerate(elements):
         rect = getattr(elem, "rect", None)
@@ -1637,10 +1638,13 @@ def run_qq_game_download_flow() -> bool:
         print("    [FAIL] 游戏详情页未找到下载按钮")
         return False
     _tap_elem(download_button, "下载")
-    if wait_for_ui_condition(download_has_started, timeout=3) is None:
+    started_elements = wait_for_ui_condition(download_has_started, timeout=3)
+    if started_elements is None:
         print("    [FAIL] 下载按钮点击后状态没有变化")
         return False
     print("    [OK] 下载已开始")
+    if not pause_active_download(started_elements):
+        return False
 
     if ARGS.capture_screenshot:
         delay_seconds = random.uniform(1.0, 2.0)
@@ -1685,6 +1689,57 @@ def download_has_started(elements) -> bool:
         ))
         for elem in elements
     )
+
+
+def _repair_mojibake_ui_text(text: str) -> str:
+    """兼容部分游戏详情文本被 GBK 字节按 Latin-1 展示的情况。"""
+    value = str(text or "")
+    try:
+        repaired = value.encode("latin-1").decode("gbk")
+        return repaired if repaired else value
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value
+
+
+def download_is_paused(elements) -> bool:
+    paused_markers = ("暂停中", "已暂停", "继续下载")
+    return any(
+        any(marker in _repair_mojibake_ui_text(elem.text) for marker in paused_markers)
+        for elem in elements
+        if elem.text
+    )
+
+
+def pause_active_download(elements=None) -> bool:
+    """点击详情页下载操作键并确认任务进入暂停状态。"""
+    current_elements = elements or get_ui_elements_safe(DEVICE_ID)
+    if download_is_paused(current_elements):
+        print("    [OK] 下载已经处于暂停状态")
+        return True
+
+    pause_button = _find_element_by_id_candidates(current_elements, [
+        "btn_action",
+        "download_pause",
+        "pause_button",
+    ])
+    if pause_button is None:
+        # 兼容未拆分 btn_action 的旧版详情页。
+        pause_button = _find_element_by_id_candidates(current_elements, [
+            "expanded_local_button",
+            "btn_container",
+        ])
+    if pause_button is None:
+        print("    [FAIL] 下载开始后未找到暂停操作按钮")
+        return False
+
+    _tap_elem(pause_button, "暂停下载")
+    log_global_ui_elements("下载开始后点击暂停前", current_elements)
+    paused_elements = wait_for_ui_condition(download_is_paused, timeout=3)
+    if paused_elements is None:
+        print("    [FAIL] 点击暂停后未检测到“暂停中”状态")
+        return False
+    print("    [OK] 下载已暂停")
+    return True
 
 
 def find_and_tap_safe(text: str = None, desc: str = None, res_id: str = None,
@@ -3013,10 +3068,13 @@ def main():
         print("    [FAIL] 未找到下载按钮")
         return
 
-    if wait_for_ui_condition(download_has_started, timeout=3) is None:
+    started_elements = wait_for_ui_condition(download_has_started, timeout=3)
+    if started_elements is None:
         print("    [FAIL] 第 17 步未通过验证：下载状态没有发生变化")
         return
     print("    [OK] 下载点击已生效，已检测到下载/安装状态")
+    if not pause_active_download(started_elements):
+        return
 
     if not ARGS.install_and_launch:
         screenshot_path = ""
