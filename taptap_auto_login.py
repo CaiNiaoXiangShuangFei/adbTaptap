@@ -24,6 +24,19 @@ import requests
 from PIL import Image
 
 from adb_locator import find_adb
+from automation_config import (
+    DEFAULT_JFBYM_API_URL,
+    DEFAULT_JFBYM_TOKEN,
+    DEFAULT_JFBYM_TYPE,
+    DEFAULT_PHONE_COUNTRY,
+    DEFAULT_PHONE_NUMBER,
+    DEFAULT_SMS_API_URL,
+    DEFAULT_SMS_TOKEN,
+    build_sms_api_url,
+    country_candidates,
+    load_account_file,
+    normalize_country,
+)
 from phone_agent.adb import *
 
 # ============ 日志系统 ============
@@ -83,18 +96,19 @@ def _close_log():
 
 # ============ 配置 ============
 TAPTAP_PACKAGE = "com.taptap"
-SMS_API_URL = "http://a.62-us.com/api/get_sms?key=03b891d2d74603649eb43c0dff4fe43a"
-PHONE_NUMBER = "3412640535"
-PHONE_COUNTRY = "United States"
+SMS_API_URL = DEFAULT_SMS_API_URL
+SMS_TOKEN = DEFAULT_SMS_TOKEN
+PHONE_NUMBER = DEFAULT_PHONE_NUMBER
+PHONE_COUNTRY = DEFAULT_PHONE_COUNTRY
 GAME_NAME = "我的休闲时光"
 GAME_PACKAGE = "com.zhixing.wdxxsg"
 
 DEFAULT_DEVICE_ID = "192.168.31.244:37145"
 
 # 云码识别配置（用于安全验证）
-JFBYM_API_URL = "http://api.jfbym.com/api/YmServer/customApi"
-JFBYM_TOKEN = "E7LhAfiKssKDUGCudpvAhgSfOoSeYuSoc5_CsEM5ONI"
-JFBYM_TYPE = "50009"
+JFBYM_API_URL = DEFAULT_JFBYM_API_URL
+JFBYM_TOKEN = DEFAULT_JFBYM_TOKEN
+JFBYM_TYPE = DEFAULT_JFBYM_TYPE
 
 
 # ============ 命令行参数 ============
@@ -103,7 +117,13 @@ def parse_args():
     parser.add_argument("--device", "-d", help="设备 ID（IP:PORT 或序列号），不指定则列出可用设备")
     parser.add_argument("--adb", help="adb 可执行文件或 platform-tools 目录；默认自动查找")
     parser.add_argument("--sms-api", help="短信验证码 API 地址", default=None)
+    parser.add_argument("--sms-token", help="短信验证码 API Token/Key", default=None)
     parser.add_argument("--phone", help="手机号", default=None)
+    parser.add_argument("--country", help="手机号国家：auto / United States / Canada", default=None)
+    parser.add_argument("--account-file", help="账号文本文件路径", default=None)
+    parser.add_argument("--jfbym-api", help="云码识别 API 地址", default=None)
+    parser.add_argument("--jfbym-token", help="云码识别 Token", default=None)
+    parser.add_argument("--jfbym-type", help="云码识别类型", default=None)
     parser.add_argument("--game", help="要搜索下载的游戏名", default=None)
     parser.add_argument("--game-package", help="目标游戏包名", default=None)
     return parser.parse_args()
@@ -174,11 +194,33 @@ _ui_mod._get_adb_prefix = _adb_prefix
 print(f"    [OK] 使用 adb: {_ADB_PATH}")
 DEVICE_ID = resolve_device_id(ARGS.device)
 
-# 用 CLI 参数覆盖配置
-if ARGS.sms_api:
-    SMS_API_URL = ARGS.sms_api
+# 账号文件覆盖默认账号，CLI 参数拥有最高优先级。
+if ARGS.account_file:
+    try:
+        account_config = load_account_file(ARGS.account_file)
+    except ValueError as exc:
+        print(f"    [FAIL] 账号文件读取失败: {exc}")
+        sys.exit(1)
+    PHONE_NUMBER = account_config.get("phone", PHONE_NUMBER)
+    PHONE_COUNTRY = account_config.get("country", PHONE_COUNTRY)
+    SMS_API_URL = account_config.get("sms_api_url", SMS_API_URL)
+    SMS_TOKEN = account_config.get("sms_token", SMS_TOKEN)
+
 if ARGS.phone:
     PHONE_NUMBER = ARGS.phone
+if ARGS.country:
+    PHONE_COUNTRY = normalize_country(ARGS.country)
+if ARGS.sms_api:
+    SMS_API_URL = ARGS.sms_api
+if ARGS.sms_token is not None:
+    SMS_TOKEN = ARGS.sms_token
+SMS_API_URL = build_sms_api_url(SMS_API_URL, SMS_TOKEN)
+if ARGS.jfbym_api:
+    JFBYM_API_URL = ARGS.jfbym_api
+if ARGS.jfbym_token is not None:
+    JFBYM_TOKEN = ARGS.jfbym_token
+if ARGS.jfbym_type:
+    JFBYM_TYPE = ARGS.jfbym_type
 if ARGS.game:
     GAME_NAME = ARGS.game
 if ARGS.game_package:
@@ -879,17 +921,37 @@ def is_country_list_page(elements) -> bool:
     )
 
 
-def is_us_country_selected(elements) -> bool:
+def is_supported_country_selected(elements) -> bool:
+    """美国和加拿大均使用 +1，任一国家均视为满足登录要求。"""
     if not is_login_page(elements):
         return False
     for elem in elements:
         resource_id = elem.resource_id or ""
         text = (elem.text or "").replace(" ", "").upper()
         if "tv_area_code" in resource_id and (
-            "+1" in text or text.startswith("US") or "美国" in text
+            "+1" in text
+            or text.startswith(("US", "CA"))
+            or "美国" in text
+            or "加拿大" in text
         ):
             return True
     return False
+
+
+def find_supported_country_element(elements, preferred_country: str):
+    labels = {
+        "United States": ("United States", "美国"),
+        "Canada": ("Canada", "加拿大"),
+    }
+    for country in country_candidates(preferred_country):
+        for label in labels[country]:
+            elem = find_element_by_text(label, elements, exact_match=False)
+            if elem:
+                return country, elem
+        elem = find_element_by_desc(country, elements, exact_match=False)
+        if elem:
+            return country, elem
+    return None, None
 
 
 def is_search_page(elements) -> bool:
@@ -1605,7 +1667,9 @@ def main():
         return
 
     # ---- 第 6 步：切换国家/地区 ----
-    _log("\n[6] 切换国家到美国...")
+    preferred_countries = country_candidates(PHONE_COUNTRY)
+    country_display = " / ".join(preferred_countries)
+    _log(f"\n[6] 切换国家到 {country_display}...")
     country_elements = log_global_ui_elements("6 切换国家前")
 
     # 当前界面显示 "CN+86"，点击后必须确认国家列表已出现。
@@ -1645,27 +1709,21 @@ def main():
         print("    [FAIL] 第 6 步失败：无法打开国家列表")
         return
 
-    # 在国家列表中下滑并选择美国
-    print("    搜索「United States」...")
+    # 美国和加拿大均使用 +1；按设置顺序选择先找到的国家。
+    print(f"    搜索「{country_display}」...")
     found = False
+    selected_country = None
     for scroll_attempt in range(10):
         elements = get_ui_elements_safe(DEVICE_ID)
-        us_elem = find_element_by_text("United States", elements, exact_match=False)
-        if not us_elem:
-            us_elem = find_element_by_text("美国", elements, exact_match=False)
-        if not us_elem:
-            us_elem = find_element_by_desc("United States", elements, exact_match=False)
+        selected_country, country_elem = find_supported_country_element(
+            elements,
+            PHONE_COUNTRY,
+        )
 
-        if us_elem and us_elem.clickable and us_elem.enabled:
-            _tap_elem(us_elem)
-            if wait_for_ui_condition(is_us_country_selected, timeout=3) is not None:
-                print("    [OK] 已选择 United States，区号已验证为 +1")
-                found = True
-                break
-        elif us_elem:
-            _tap_elem(us_elem)
-            if wait_for_ui_condition(is_us_country_selected, timeout=3) is not None:
-                print("    [OK] 已选择 United States，区号已验证为 +1")
+        if country_elem:
+            _tap_elem(country_elem)
+            if wait_for_ui_condition(is_supported_country_selected, timeout=3) is not None:
+                print(f"    [OK] 已选择 {selected_country}，区号已验证为 +1")
                 found = True
                 break
 
@@ -1674,22 +1732,29 @@ def main():
             time.sleep(CLICK_SETTLE_DELAY)
 
     if not found:
-        print("    [WARN] 未找到 United States，尝试直接输入查找...")
+        print(f"    [WARN] 未找到 {country_display}，尝试直接输入查找...")
         search_inputs = find_text_input_elements(get_ui_elements_safe(DEVICE_ID))
-        if search_inputs and input_text_verified(search_inputs[0], "United States"):
+        for country in preferred_countries:
+            if not search_inputs or not input_text_verified(search_inputs[0], country):
+                continue
             for _ in range(5):
                 elements = get_ui_elements_safe(DEVICE_ID)
-                us_elem = find_element_by_text("United States", elements, exact_match=False)
-                if us_elem:
-                    _tap_elem(us_elem)
-                    if wait_for_ui_condition(is_us_country_selected, timeout=3) is not None:
-                        print("    [OK] 通过搜索选择 United States，区号已验证为 +1")
+                selected_country, country_elem = find_supported_country_element(
+                    elements,
+                    country,
+                )
+                if country_elem:
+                    _tap_elem(country_elem)
+                    if wait_for_ui_condition(is_supported_country_selected, timeout=3) is not None:
+                        print(f"    [OK] 通过搜索选择 {selected_country}，区号已验证为 +1")
                         found = True
                         break
                 time.sleep(CLICK_RETRY_DELAY)
+            if found:
+                break
 
     if not found:
-        print("    [FAIL] 第 6 步未通过验证：国家区号不是 United States +1")
+        print("    [FAIL] 第 6 步未通过验证：国家区号不是美国/加拿大 +1")
         return
 
     time.sleep(CLICK_SETTLE_DELAY)

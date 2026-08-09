@@ -33,6 +33,18 @@ if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
 from adb_locator import find_adb
+from automation_config import (
+    COUNTRY_OPTIONS,
+    DEFAULT_JFBYM_API_URL,
+    DEFAULT_JFBYM_TOKEN,
+    DEFAULT_JFBYM_TYPE,
+    DEFAULT_PHONE_COUNTRY,
+    DEFAULT_SMS_API_URL,
+    DEFAULT_SMS_TOKEN,
+    load_account_file,
+    normalize_country,
+    parse_account_text,
+)
 
 # 运行自动化脚本用的 Python：优先使用项目 venv
 _VENV_PY = os.path.join(PROJECT_DIR, ".venv", "Scripts", "python.exe")
@@ -40,11 +52,25 @@ PYTHON_PATH = _VENV_PY if os.path.isfile(_VENV_PY) else sys.executable
 
 ADB_PATH = None
 
+SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
+ACCOUNTS_DIR = os.path.join(BASE_DIR, "accounts")
+DEFAULT_SETTINGS = {
+    "country": DEFAULT_PHONE_COUNTRY,
+    "sms_api_url": DEFAULT_SMS_API_URL,
+    "sms_token": DEFAULT_SMS_TOKEN,
+    "jfbym_api_url": DEFAULT_JFBYM_API_URL,
+    "jfbym_token": DEFAULT_JFBYM_TOKEN,
+    "jfbym_type": DEFAULT_JFBYM_TYPE,
+    "account_file": "",
+}
+_SETTING_KEYS = set(DEFAULT_SETTINGS)
+
 # 电池 status 数值含义（dumpsys battery）
 BATTERY_STATUS = {1: "未知", 2: "充电中", 3: "放电中", 4: "未充电", 5: "已充满"}
 
 _state_lock = threading.Lock()
 _screenshot_lock = threading.Lock()
+_settings_lock = threading.Lock()
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
@@ -106,6 +132,141 @@ def capture_screenshot(serial: str) -> tuple[bytes | None, str | None]:
                 time.sleep(0.25)
 
     return None, last_error
+
+
+# ============ 自动化设置与账号文件 ============
+
+
+def _read_settings_unlocked() -> dict:
+    settings = dict(DEFAULT_SETTINGS)
+    if os.path.isfile(SETTINGS_PATH):
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as file:
+                saved = json.load(file)
+            if isinstance(saved, dict):
+                for key in _SETTING_KEYS:
+                    if key in saved and isinstance(saved[key], str):
+                        settings[key] = saved[key]
+        except (OSError, ValueError):
+            pass
+    settings["country"] = normalize_country(settings.get("country"))
+    return settings
+
+
+def load_settings() -> dict:
+    with _settings_lock:
+        return _read_settings_unlocked()
+
+
+def _write_settings_unlocked(settings: dict) -> None:
+    temp_path = SETTINGS_PATH + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as file:
+        json.dump(settings, file, ensure_ascii=False, indent=2)
+    os.replace(temp_path, SETTINGS_PATH)
+
+
+def _selected_account(settings: dict) -> tuple[str | None, dict | None, str | None]:
+    filename = os.path.basename(settings.get("account_file") or "")
+    if not filename:
+        return None, None, None
+    path = os.path.join(ACCOUNTS_DIR, filename)
+    try:
+        account = load_account_file(path)
+    except ValueError as exc:
+        return filename, None, str(exc)
+    return filename, account, None
+
+
+def api_settings_get() -> dict:
+    settings = load_settings()
+    filename, account, account_error = _selected_account(settings)
+    return {
+        "ok": True,
+        "settings": {key: settings[key] for key in _SETTING_KEYS if key != "account_file"},
+        "countries": [
+            {"value": value, "label": label}
+            for value, label in COUNTRY_OPTIONS.items()
+        ],
+        "account": {
+            "filename": filename,
+            "phone": (account or {}).get("phone"),
+            "country": (account or {}).get("country"),
+            "error": account_error,
+        } if filename else None,
+    }
+
+
+def api_settings_save(data: dict) -> dict:
+    with _settings_lock:
+        settings = _read_settings_unlocked()
+        if "country" in data:
+            settings["country"] = normalize_country(data.get("country"))
+        for key in (
+            "sms_api_url", "sms_token", "jfbym_api_url", "jfbym_token", "jfbym_type",
+        ):
+            if key in data:
+                value = str(data.get(key) or "").strip()
+                if len(value) > 4096:
+                    return {"ok": False, "message": f"{key} 内容过长"}
+                settings[key] = value
+        if not settings["sms_api_url"]:
+            return {"ok": False, "message": "短信 API 地址不能为空"}
+        if not settings["jfbym_api_url"]:
+            return {"ok": False, "message": "云码 API 地址不能为空"}
+        _write_settings_unlocked(settings)
+    result = api_settings_get()
+    result["message"] = "设置已保存，将在下次任务启动时生效"
+    return result
+
+
+def api_account_select(filename: str, content: str) -> dict:
+    original_name = os.path.basename(filename or "").strip()
+    if not original_name.lower().endswith(".txt"):
+        return {"ok": False, "message": "请选择 .txt 账号文件"}
+    if not isinstance(content, str):
+        return {"ok": False, "message": "账号文件内容无效"}
+    if len((content or "").encode("utf-8")) > 1024 * 1024:
+        return {"ok": False, "message": "账号文件不能超过 1 MB"}
+    try:
+        account = parse_account_text(content)
+    except ValueError as exc:
+        return {"ok": False, "message": str(exc)}
+
+    stem, _ = os.path.splitext(original_name)
+    safe_stem = re.sub(r"[^0-9A-Za-z._\-\u4e00-\u9fff]+", "_", stem).strip("._")
+    safe_name = (safe_stem or "account")[:100] + ".txt"
+    os.makedirs(ACCOUNTS_DIR, exist_ok=True)
+    account_path = os.path.join(ACCOUNTS_DIR, safe_name)
+    try:
+        with open(account_path, "w", encoding="utf-8") as file:
+            file.write(content)
+    except OSError as exc:
+        return {"ok": False, "message": f"账号文件保存失败: {exc}"}
+
+    with _settings_lock:
+        settings = _read_settings_unlocked()
+        settings["account_file"] = safe_name
+        if account.get("country"):
+            settings["country"] = normalize_country(account["country"])
+        _write_settings_unlocked(settings)
+    return {
+        "ok": True,
+        "message": f"已选择账号文件: {safe_name}",
+        "account": {
+            "filename": safe_name,
+            "phone": account.get("phone"),
+            "country": account.get("country"),
+        },
+        "settings": api_settings_get()["settings"],
+    }
+
+
+def api_account_clear() -> dict:
+    with _settings_lock:
+        settings = _read_settings_unlocked()
+        settings["account_file"] = ""
+        _write_settings_unlocked(settings)
+    return {"ok": True, "message": "已取消选择账号文件", "account": None}
 
 
 # ============ 设备信息 ============
@@ -274,10 +435,32 @@ TASKS = {}
 _TASK_LOCK = threading.Lock()
 
 
+def build_task_command(serial: str, settings: dict, account_filename: str | None) -> list[str]:
+    command = [
+        PYTHON_PATH, "-u", TAPTAP_SCRIPT,
+        "--device", serial,
+        "--adb", ADB_PATH,
+        "--country", settings["country"],
+        "--sms-api", settings["sms_api_url"],
+        "--sms-token", settings["sms_token"],
+        "--jfbym-api", settings["jfbym_api_url"],
+        "--jfbym-token", settings["jfbym_token"],
+        "--jfbym-type", settings["jfbym_type"],
+    ]
+    if account_filename:
+        command.extend(["--account-file", os.path.join(ACCOUNTS_DIR, account_filename)])
+    return command
+
+
 def api_task_run(serial: str) -> dict:
     """启动 TapTap 自动登录脚本（子进程，实时采集日志）。同一时间只允许一个任务。"""
     if not os.path.isfile(TAPTAP_SCRIPT):
         return {"ok": False, "message": f"找不到脚本: {TAPTAP_SCRIPT}"}
+    settings = load_settings()
+    account_filename, account, account_error = _selected_account(settings)
+    if account_filename and account_error:
+        return {"ok": False, "message": f"账号文件不可用: {account_error}"}
+
     with _TASK_LOCK:
         for t in TASKS.values():
             if t["status"] == "running":
@@ -293,16 +476,15 @@ def api_task_run(serial: str) -> dict:
         }
         TASKS[task["id"]] = task
 
+    command = build_task_command(serial, settings, account_filename)
+
     try:
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         env["ADB_PATH"] = ADB_PATH
         proc = subprocess.Popen(
-            [
-                PYTHON_PATH, "-u", TAPTAP_SCRIPT,
-                "--device", serial, "--adb", ADB_PATH,
-            ],
+            command,
             cwd=PROJECT_DIR,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -319,6 +501,13 @@ def api_task_run(serial: str) -> dict:
         return {"ok": False, "message": f"任务启动失败: {e}"}
 
     task["proc"] = proc
+    if account_filename and account:
+        task["lines"].append(
+            f"[系统] 账号文件: {account_filename} | 手机号: {account.get('phone', '-')}"
+        )
+    task["lines"].append(
+        f"[系统] 国家设置: {COUNTRY_OPTIONS.get(settings['country'], settings['country'])}"
+    )
     threading.Thread(target=_task_reader, args=(task["id"], proc), daemon=True).start()
     return {"ok": True, "id": task["id"], "message": "任务已启动"}
 
@@ -448,6 +637,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/devices":
             return self._send_json({"ok": True, "devices": api_devices()})
 
+        if path == "/api/settings":
+            return self._send_json(api_settings_get())
+
         if path == "/api/task":
             offset = 0
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -466,6 +658,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
+        if length > 2 * 1024 * 1024:
+            return self._send_json({"ok": False, "message": "请求内容不能超过 2 MB"}, 413)
         raw = self.rfile.read(length) if length else b"{}"
         try:
             data = json.loads(raw.decode("utf-8")) if raw.strip() else {}
@@ -481,6 +675,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(api_task_run(data.get("serial", "")))
         if path == "/api/task/stop":
             return self._send_json(api_task_stop())
+        if path == "/api/settings":
+            return self._send_json(api_settings_save(data))
+        if path == "/api/account/select":
+            return self._send_json(api_account_select(
+                data.get("filename", ""),
+                data.get("content", ""),
+            ))
+        if path == "/api/account/clear":
+            return self._send_json(api_account_clear())
         if path == "/api/disconnect":
             return self._send_json(api_disconnect(data.get("address", "")))
         if path == "/api/tcpip":

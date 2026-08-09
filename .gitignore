@@ -14,3 +14,7 @@ __pycache__/
 # 运行日志
 taptap_log_*.log
 *.log
+
+# 本地账号与 Token 设置（包含敏感信息）
+adb_manager/settings.json
+adb_manager/accounts/

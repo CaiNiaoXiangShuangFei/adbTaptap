@@ -63,13 +63,49 @@
     padding: 10px; height: 220px; overflow: auto; font-family: Consolas, monospace; font-size: 12px;
     line-height: 1.6; white-space: pre-wrap; word-break: break-all; color: var(--text);
   }
+  .task-config {
+    display: grid; grid-template-columns: minmax(240px, .8fr) minmax(360px, 1.5fr);
+    gap: 12px; margin-bottom: 14px;
+  }
+  .config-field {
+    background: var(--bg); border: 1px solid var(--line); border-radius: 9px;
+    padding: 10px 12px; min-width: 0;
+  }
+  .config-field > label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 7px; }
+  .config-field select, .settings-input {
+    width: 100%; background: var(--card2); border: 1px solid var(--line); color: var(--text);
+    padding: 8px 10px; border-radius: 7px; font-size: 13px; outline: none;
+  }
+  .config-field select:focus, .settings-input:focus { border-color: var(--blue); }
+  .account-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .account-file { display: none; }
+  .account-meta { color: var(--muted); font-size: 12px; min-width: 0; word-break: break-all; }
+  .settings-card {
+    width: min(680px, 94vw); max-height: 88vh; overflow: auto; background: var(--card);
+    border: 1px solid var(--line); border-radius: var(--radius); padding: 22px;
+    box-shadow: 0 16px 60px rgba(0,0,0,.5);
+  }
+  .settings-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
+  .settings-head h2 { font-size: 18px; }
+  .settings-close { color: var(--muted); font-size: 26px; cursor: pointer; line-height: 1; }
+  .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .settings-field { min-width: 0; }
+  .settings-field.full { grid-column: 1 / -1; }
+  .settings-field label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  .secret-row { display: flex; gap: 7px; }
+  .secret-row .settings-input { flex: 1; min-width: 0; }
+  .settings-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+  .settings-hint { color: var(--muted); font-size: 12px; line-height: 1.6; margin-top: 10px; }
   .pair-form { display: grid; grid-template-columns: 1fr 150px 1fr auto; gap: 10px; margin-top: 12px; }
   .pair-form input {
     background: var(--bg); border: 1px solid var(--line); color: var(--text);
     padding: 9px 12px; border-radius: 8px; font-size: 14px; outline: none;
   }
   .pair-form input:focus { border-color: var(--blue); }
-  @media (max-width: 900px) { .pair-form { grid-template-columns: 1fr; } }
+  @media (max-width: 900px) {
+    .pair-form, .task-config, .settings-grid { grid-template-columns: 1fr; }
+    .settings-field.full { grid-column: auto; }
+  }
   details { margin-top: 12px; font-size: 13px; }
   summary { cursor: pointer; color: var(--blue); user-select: none; }
   .guide { margin: 8px 0 0 6px; padding-left: 14px; border-left: 2px solid var(--line); color: var(--muted); line-height: 1.9; }
@@ -160,6 +196,7 @@
     <label class="muted" style="display:flex;align-items:center;gap:4px;">
       <input type="checkbox" id="autoRefresh" checked> 自动刷新
     </label>
+    <button class="btn" id="btnSettings">设置</button>
     <button class="btn" id="btnRefresh">刷新</button>
   </div>
 </header>
@@ -210,6 +247,26 @@
   <!-- 自动化任务 -->
   <div class="connect-card">
     <h2>自动化任务</h2>
+    <div class="task-config">
+      <div class="config-field">
+        <label for="taskCountry">手机号国家/地区</label>
+        <select id="taskCountry" title="选择手机号国家或地区">
+          <option value="auto">美国或加拿大（自动）</option>
+          <option value="United States">美国（United States）</option>
+          <option value="Canada">加拿大（Canada）</option>
+        </select>
+      </div>
+      <div class="config-field">
+        <label>当前账号文本文件</label>
+        <div class="account-row">
+          <input class="account-file" id="accountFile" type="file" accept=".txt,text/plain">
+          <button class="btn" id="btnChooseAccount" type="button">选择账号文件</button>
+          <button class="btn danger" id="btnClearAccount" type="button">取消选择</button>
+          <span class="account-meta" id="accountMeta">使用默认账号</span>
+        </div>
+        <div class="settings-hint">支持纯手机号、JSON，或 <code>phone=手机号</code>、<code>country=Canada</code> 格式。</div>
+      </div>
+    </div>
     <div class="connect-row">
       <select id="taskDevice" class="task-select" title="选择目标设备"></select>
       <button class="btn primary" id="btnRunTask">运行 TapTap 自动登录</button>
@@ -256,6 +313,49 @@
     <button class="btn" onclick="sendKey(187)">最近任务</button>
     <button class="btn" onclick="saveSnapshot()">保存截图</button>
     <button class="btn danger" onclick="closePreview()">停止预览</button>
+  </div>
+</div>
+
+<!-- 设置页面 -->
+<div class="modal" id="settingsModal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+  <div class="settings-card">
+    <div class="settings-head">
+      <h2 id="settingsTitle">自动化设置</h2>
+      <span class="settings-close" id="settingsClose" aria-label="关闭设置">&times;</span>
+    </div>
+    <div class="settings-grid">
+      <div class="settings-field full">
+        <label for="settingSmsApi">短信 API 地址</label>
+        <input class="settings-input" id="settingSmsApi" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="settings-field full">
+        <label for="settingSmsToken">短信 API Token / Key</label>
+        <div class="secret-row">
+          <input class="settings-input" id="settingSmsToken" type="password" autocomplete="off" spellcheck="false">
+          <button class="btn" type="button" data-toggle-secret="settingSmsToken">显示</button>
+        </div>
+      </div>
+      <div class="settings-field full">
+        <label for="settingJfbymApi">云码识别 API 地址</label>
+        <input class="settings-input" id="settingJfbymApi" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="settings-field">
+        <label for="settingJfbymToken">云码识别 Token</label>
+        <div class="secret-row">
+          <input class="settings-input" id="settingJfbymToken" type="password" autocomplete="off" spellcheck="false">
+          <button class="btn" type="button" data-toggle-secret="settingJfbymToken">显示</button>
+        </div>
+      </div>
+      <div class="settings-field">
+        <label for="settingJfbymType">云码识别类型</label>
+        <input class="settings-input" id="settingJfbymType" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+    <div class="settings-hint">设置保存在当前电脑，下次打开页面仍然有效；修改后的内容从下一次任务启动开始使用。</div>
+    <div class="settings-actions">
+      <button class="btn" id="btnCancelSettings" type="button">取消</button>
+      <button class="btn primary" id="btnSaveSettings" type="button">保存设置</button>
+    </div>
   </div>
 </div>
 
@@ -587,8 +687,10 @@ async function apiPost(url, body) {
     });
     const data = await res.json();
     if (data && data.message && !data.ok) toast(data.message, "err");
+    return data;
   } catch (e) {
     toast("操作失败：" + e.message, "err");
+    return null;
   }
 }
 
@@ -648,9 +750,128 @@ document.getElementById("pvModal").addEventListener("click", e => {
 });
 document.addEventListener("keydown", e => {
   if (e.key !== "Escape") return;
-  if (document.getElementById("pvModal").classList.contains("show")) closePreview();
+  if (document.getElementById("settingsModal").classList.contains("show")) closeSettings();
+  else if (document.getElementById("pvModal").classList.contains("show")) closePreview();
   else closeModal();
 });
+
+// ---------- 账号与设置 ----------
+let automationSettings = null;
+
+function renderAccount(account) {
+  const meta = document.getElementById("accountMeta");
+  const clearBtn = document.getElementById("btnClearAccount");
+  if (!account || !account.filename) {
+    meta.textContent = "使用默认账号";
+    clearBtn.disabled = true;
+    return;
+  }
+  const details = [account.filename];
+  if (account.phone) details.push("手机号 " + account.phone);
+  if (account.country) details.push(account.country);
+  if (account.error) details.push("读取失败：" + account.error);
+  meta.textContent = details.join(" · ");
+  clearBtn.disabled = false;
+}
+
+function applySettingsPayload(payload) {
+  if (!payload) return;
+  const settings = payload.settings || {};
+  automationSettings = settings;
+  if (payload.countries && payload.countries.length) {
+    const country = document.getElementById("taskCountry");
+    country.innerHTML = payload.countries.map(item =>
+      '<option value="' + esc(item.value) + '">' + esc(item.label) + '</option>'
+    ).join("");
+  }
+  document.getElementById("taskCountry").value = settings.country || "auto";
+  document.getElementById("settingSmsApi").value = settings.sms_api_url || "";
+  document.getElementById("settingSmsToken").value = settings.sms_token || "";
+  document.getElementById("settingJfbymApi").value = settings.jfbym_api_url || "";
+  document.getElementById("settingJfbymToken").value = settings.jfbym_token || "";
+  document.getElementById("settingJfbymType").value = settings.jfbym_type || "";
+  if (Object.prototype.hasOwnProperty.call(payload, "account")) renderAccount(payload.account);
+}
+
+async function loadAutomationSettings() {
+  try {
+    const res = await fetch("/api/settings", { cache: "no-store" });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.message || "读取设置失败");
+    applySettingsPayload(data);
+  } catch (e) {
+    toast("读取设置失败：" + e.message, "err");
+  }
+}
+
+function openSettings() {
+  document.getElementById("settingsModal").classList.add("show");
+  loadAutomationSettings();
+}
+
+function closeSettings() {
+  document.getElementById("settingsModal").classList.remove("show");
+}
+
+async function saveSettings() {
+  const btn = document.getElementById("btnSaveSettings");
+  btn.disabled = true;
+  const data = await apiPost("/api/settings", {
+    country: document.getElementById("taskCountry").value,
+    sms_api_url: document.getElementById("settingSmsApi").value.trim(),
+    sms_token: document.getElementById("settingSmsToken").value.trim(),
+    jfbym_api_url: document.getElementById("settingJfbymApi").value.trim(),
+    jfbym_token: document.getElementById("settingJfbymToken").value.trim(),
+    jfbym_type: document.getElementById("settingJfbymType").value.trim(),
+  });
+  btn.disabled = false;
+  if (!data || !data.ok) return;
+  applySettingsPayload(data);
+  toast("✓ " + data.message, "ok");
+  closeSettings();
+}
+
+async function saveCountry() {
+  const data = await apiPost("/api/settings", {
+    country: document.getElementById("taskCountry").value,
+  });
+  if (data && data.ok) {
+    applySettingsPayload(data);
+    toast("✓ 国家设置已保存", "ok");
+  }
+}
+
+async function selectAccountFile(file) {
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith(".txt")) {
+    toast("请选择 .txt 账号文件", "err");
+    return;
+  }
+  if (file.size > 1024 * 1024) {
+    toast("账号文件不能超过 1 MB", "err");
+    return;
+  }
+  try {
+    const content = await file.text();
+    const data = await apiPost("/api/account/select", { filename: file.name, content });
+    if (data && data.ok) {
+      applySettingsPayload(data);
+      toast("✓ " + data.message, "ok");
+    }
+  } catch (e) {
+    toast("读取账号文件失败：" + e.message, "err");
+  } finally {
+    document.getElementById("accountFile").value = "";
+  }
+}
+
+async function clearAccount() {
+  const data = await apiPost("/api/account/clear", {});
+  if (data && data.ok) {
+    renderAccount(null);
+    toast("✓ " + data.message, "ok");
+  }
+}
 
 // ---------- 自动化任务 ----------
 let taskId = null;
@@ -765,6 +986,29 @@ function toast(msg, type) {
 document.getElementById("btnConnect").addEventListener("click", doConnect);
 document.getElementById("btnPair").addEventListener("click", doPair);
 document.getElementById("btnRefresh").addEventListener("click", loadDevices);
+document.getElementById("btnSettings").addEventListener("click", openSettings);
+document.getElementById("settingsClose").addEventListener("click", closeSettings);
+document.getElementById("btnCancelSettings").addEventListener("click", closeSettings);
+document.getElementById("btnSaveSettings").addEventListener("click", saveSettings);
+document.getElementById("settingsModal").addEventListener("click", e => {
+  if (e.target.id === "settingsModal") closeSettings();
+});
+document.getElementById("taskCountry").addEventListener("change", saveCountry);
+document.getElementById("btnChooseAccount").addEventListener("click", () => {
+  document.getElementById("accountFile").click();
+});
+document.getElementById("btnClearAccount").addEventListener("click", clearAccount);
+document.getElementById("accountFile").addEventListener("change", e => {
+  selectAccountFile(e.target.files && e.target.files[0]);
+});
+document.querySelectorAll("[data-toggle-secret]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const input = document.getElementById(btn.dataset.toggleSecret);
+    const visible = input.type === "text";
+    input.type = visible ? "password" : "text";
+    btn.textContent = visible ? "显示" : "隐藏";
+  });
+});
 ipInput.addEventListener("keydown", e => { if (e.key === "Enter") doConnect(); });
 
 // 自动化任务按钮
@@ -790,6 +1034,7 @@ setInterval(() => {
 }, 4000);
 
 loadDevices();
+loadAutomationSettings();
 </script>
 </body>
 </html>
