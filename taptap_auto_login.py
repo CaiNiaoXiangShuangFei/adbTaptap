@@ -592,75 +592,28 @@ def input_phone_number(phone_number: str) -> bool:
     return _phone_number_is_present(get_ui_elements_safe(DEVICE_ID), phone_number)
 
 
-def find_consent_element(elements):
-    """识别登录协议弹窗的肯定按钮，包括不可点击的文字子节点。"""
-    consent_texts = [
-        "同意并继续",
-        "同意并登录",
-        "同意并继续登录",
-        "确认并继续",
-    ]
-    for text in consent_texts:
-        for elem in elements:
-            if (elem.text or "").strip() == text:
-                return elem
-
-    elem = _find_element_by_id_candidates(elements, [
-        "dialog_btn_right",
-        "btn_agree",
-        "btn_confirm",
-        "confirm",
-    ])
-    if elem:
-        return elem
-
-    has_agreement_text = any(
-        marker in (candidate.text or "")
-        for candidate in elements
-        for marker in ("服务协议", "隐私政策", "用户协议")
-    )
-    if has_agreement_text:
-        for text in ("同意", "继续"):
-            for candidate in elements:
-                if (candidate.text or "").strip() == text:
-                    return candidate
-    return None
-
-
-def find_agreement_checkbox_element(elements):
-    """查找登录页或协议弹窗中的协议复选框。"""
-    for elem in elements:
-        if "CheckBox" in (elem.class_name or ""):
-            return elem
-    elem = _find_element_by_id_candidates(elements, [
-        "checkbox",
-        "agreement_checkbox",
-        "agreement_check",
-        "cb_agreement",
-        "privacy_checkbox",
-        "protocol_checkbox",
-        "iv_agree",
-    ])
-    if elem:
-        return elem
-    for elem in elements:
-        resource_id = (elem.resource_id or "").lower()
-        if any(marker in resource_id for marker in ("agreement", "protocol", "privacy")) \
-                and any(marker in resource_id for marker in ("check", "agree", "select")):
-            return elem
-    for elem in elements:
-        if (elem.text or "").strip() == "我已阅读并同意":
-            return elem
-    return None
-
-
-def consent_dialog_visible(elements) -> bool:
-    has_agreement_text = any(
-        text in (elem.text or "")
+def find_agreement_radio_element(elements):
+    """查找登录页“勾选即代表同意…”对应的 RadioButton。"""
+    radio_buttons = [
+        elem
         for elem in elements
-        for text in ("服务协议", "隐私政策", "用户协议")
-    )
-    return has_agreement_text and find_consent_element(elements) is not None
+        if "RadioButton" in (elem.class_name or "")
+    ]
+    for elem in radio_buttons:
+        resource_id = (elem.resource_id or "").lower()
+        if any(marker in resource_id for marker in (
+            "agreement", "protocol", "privacy", "agree", "radio",
+        )):
+            return elem
+    if radio_buttons:
+        # 当前登录页只有一个 RadioButton；资源 id 改名时仍可识别。
+        return radio_buttons[0]
+    return None
+
+
+def agreement_radio_is_checked(elements) -> bool:
+    radio = find_agreement_radio_element(elements)
+    return radio is not None and bool(getattr(radio, "checked", False))
 
 
 def wait_for_ui_condition(predicate, timeout: float = 8, interval: float = 0.5):
@@ -1623,26 +1576,38 @@ def main():
     _tap_xy(500, 500)
     time.sleep(0.5)
 
-    # ---- 第 8 步：勾选协议并点击登录 ----
+    # ---- 第 8 步：勾选协议 RadioButton 并点击登录 ----
     print("\n[8] 勾选服务协议和隐私政策并点击登录...")
-    agreement_elements = get_ui_elements_safe(DEVICE_ID)
-    agreement_checkbox = find_agreement_checkbox_element(agreement_elements)
-    if agreement_checkbox:
-        if getattr(agreement_checkbox, "checked", False):
-            print("    [OK] 服务协议和隐私政策已勾选")
-        else:
-            print(f"      → 协议勾选框: {_elem_desc(agreement_checkbox)}")
-            _tap_elem(agreement_checkbox)
-            time.sleep(0.8)
-            fresh_checkbox = find_agreement_checkbox_element(
-                get_ui_elements_safe(DEVICE_ID)
-            )
-            if fresh_checkbox and getattr(fresh_checkbox, "checked", False):
-                print("    [OK] 协议勾选状态已验证")
-            else:
-                print("    [INFO] 已执行协议勾选，最终状态由登录页面跳转验证")
-    else:
-        print("    [INFO] 登录页未暴露协议勾选框，登录后处理确认弹窗")
+    agreement_checked = False
+    for attempt in range(1, 4):
+        agreement_elements = get_ui_elements_safe(DEVICE_ID)
+        agreement_radio = find_agreement_radio_element(agreement_elements)
+        if agreement_radio is None:
+            print(f"    [WARN] 第 {attempt} 次未找到协议 RadioButton")
+            time.sleep(0.6)
+            continue
+
+        if getattr(agreement_radio, "checked", False):
+            agreement_checked = True
+            print("    [OK] 协议 RadioButton 已是选中状态（checked=true）")
+            break
+
+        print(f"      → 协议 RadioButton: {_elem_desc(agreement_radio)}")
+        _tap_elem(agreement_radio)
+        checked_elements = wait_for_ui_condition(
+            agreement_radio_is_checked,
+            timeout=3,
+            interval=0.3,
+        )
+        if checked_elements is not None:
+            agreement_checked = True
+            print("    [OK] 协议 RadioButton 已勾选并读回 checked=true")
+            break
+        print(f"    [WARN] 第 {attempt} 次点击后 RadioButton 仍未选中")
+
+    if not agreement_checked:
+        print("    [FAIL] 无法确认协议 RadioButton 已勾选，停止登录")
+        return
 
     login_clicked = find_and_tap_safe(text="登录", clickable=True, retries=5)
     if login_clicked:
@@ -1657,44 +1622,51 @@ def main():
 
     time.sleep(1.5)
 
-    # ---- 第 9 步：处理服务协议和隐私政策弹窗 ----
-    print("\n[9] 处理服务协议和隐私政策弹窗...")
-    consent_found = False
-    checkbox_clicked = False
+    # ---- 第 9 步：验证登录提交结果 ----
+    print("\n[9] 验证协议勾选和登录提交状态...")
+    submission_verified = False
     login_retried = False
-    empty_rounds = 0
+    non_login_rounds = 0
     for attempt in range(15):
         try:
             elems = get_ui_elements_safe(DEVICE_ID)
         except Exception as exc:
-            print(f"    [WARN] 读取协议弹窗失败，正在重试: {exc}")
+            print(f"    [WARN] 读取登录提交状态失败，正在重试: {exc}")
             time.sleep(0.5)
             continue
 
-        consent = find_consent_element(elems)
-        if consent:
-            print(f"    找到同意按钮: {_elem_desc(consent)}")
-            _tap_elem(consent)
-            time.sleep(1)
-            after_click = get_ui_elements_safe(DEVICE_ID)
-            if find_consent_element(after_click) is None:
-                consent_found = True
-                print("    [OK] 已点击协议确认按钮，弹窗已关闭")
+        if not elems:
+            print("    [WARN] UI 数据为空，暂不判断登录页已离开")
+            time.sleep(0.5)
+            continue
+
+        if not is_login_page(elems):
+            non_login_rounds += 1
+            if non_login_rounds >= 2:
+                submission_verified = True
+                print("    [OK] 连续两次确认已离开登录页")
                 break
-            print("    [WARN] 协议确认按钮仍然存在，继续重试...")
+            time.sleep(0.5)
             continue
 
-        # 某些版本的弹窗要求先勾选，再显示/启用确认按钮。
-        checkbox = find_agreement_checkbox_element(elems)
-        if checkbox and not checkbox_clicked and not getattr(checkbox, "checked", False):
-            print(f"    找到协议勾选框: {_elem_desc(checkbox)}")
-            _tap_elem(checkbox)
-            checkbox_clicked = True
-            time.sleep(0.8)
-            continue
+        non_login_rounds = 0
+        agreement_radio = find_agreement_radio_element(elems)
+        if agreement_radio is None:
+            print("    [FAIL] 仍在登录页，但协议 RadioButton 已无法识别")
+            return
+        if not getattr(agreement_radio, "checked", False):
+            print("    [WARN] 登录页协议 RadioButton 变为未选中，重新勾选并验证...")
+            _tap_elem(agreement_radio)
+            if wait_for_ui_condition(
+                agreement_radio_is_checked,
+                timeout=3,
+                interval=0.3,
+            ) is None:
+                print("    [FAIL] 协议 RadioButton 重新勾选失败")
+                return
+            print("    [OK] 协议 RadioButton 已重新验证为 checked=true")
 
-        empty_rounds += 1
-        if empty_rounds >= 3 and not consent_dialog_visible(elems):
+        if attempt >= 2 and not login_retried:
             login_button = _find_element_by_id_candidates(
                 elems, ["login_register_btn"]
             )
@@ -1703,26 +1675,19 @@ def main():
                     (elem for elem in elems if (elem.text or "").strip() == "登录"),
                     None,
                 )
-
-            if login_button and not login_retried:
-                print("    [WARN] 仍停留在登录页，重新点击登录以触发协议确认...")
-                _tap_elem(login_button)
-                login_retried = True
-                empty_rounds = 0
-                time.sleep(1)
-                continue
-
-            if not login_button:
-                consent_found = True
-                print("    [OK] 未检测到协议确认弹窗，登录流程已继续")
-                break
+            if login_button is None:
+                print("    [FAIL] 仍在登录页，但无法找到登录按钮")
+                return
+            print("    [WARN] 仍停留在登录页，重新点击登录并继续验证...")
+            _tap_elem(login_button)
+            login_retried = True
 
         time.sleep(0.5)
 
-    if not consent_found:
-        print("    [FAIL] 未能完成服务协议和隐私政策确认")
+    if not submission_verified:
+        print("    [FAIL] 协议虽已勾选，但点击登录后仍未离开登录页")
         return
-    print("    [OK] 第 8/9 步验证通过：协议确认完成且已离开登录提交状态")
+    print("    [OK] 第 8/9 步验证通过：RadioButton 已勾选且登录已提交")
 
     time.sleep(20)
     print("\n[9.5] 检查是否有安全验证...")
