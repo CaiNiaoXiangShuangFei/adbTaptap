@@ -1415,6 +1415,8 @@ async function runTask() {
 function taskStatusBadge(status) {
   const map = {
     running: '<span class="badge online">运行中</span>',
+    pause_pending: '<span class="badge unauthorized">等待暂停</span>',
+    paused: '<span class="badge unauthorized">已暂停</span>',
     success: '<span class="badge online">全部完成</span>',
     partial: '<span class="badge offline">部分失败</span>',
     stopped: '<span class="badge offline">已停止</span>',
@@ -1436,7 +1438,7 @@ function renderTaskOverview() {
   }
   tabs.innerHTML = taskStates.map(task => {
     const active = task.serial === activeLogSerial ? " active" : "";
-    const running = task.status === "running" ? " running" : "";
+    const running = ["running", "pause_pending", "paused"].includes(task.status) ? " running" : "";
     return '<button class="log-tab' + active + running + '" data-log-serial="' + esc(task.serial) + '">' +
       esc(task.serial) + ' · ' + task.progress + '/' + task.total + '</button>';
   }).join("");
@@ -1502,7 +1504,7 @@ async function pollTasks() {
     await Promise.all(jobs);
   } catch (_) {
   }
-  const active = taskStates.some(task => task.status === "running");
+  const active = taskStates.some(task => ["running", "pause_pending", "paused"].includes(task.status));
   taskTimer = setTimeout(pollTasks, active ? 800 : 2000);
 }
 
@@ -1512,7 +1514,7 @@ function updateRunControls() {
   const runnableAccountCount = accountQueue.filter(
     account => account.selected && !["completed", "queued", "running"].includes(account.status)
   ).length;
-  const running = taskStates.some(task => task.status === "running");
+  const running = taskStates.some(task => ["running", "pause_pending", "paused"].includes(task.status));
   const hasGameName = !!document.getElementById("taskGameName").value.trim();
   const selectedSerials = [...selectedDevices];
   const newAccountSerials = selectedSerials.filter(
@@ -1953,5 +1955,6 @@ loadAutomationSettings();
 loadAccounts();
 pollTasks();
 </script>
+<script src="/static/phase1_controls.js"></script>
 </body>
 </html>

@@ -13,6 +13,7 @@ ADB 设备管理 Web 服务
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -402,7 +403,7 @@ def api_accounts_get() -> dict:
     active_status = {}
     with _TASK_LOCK:
         for task in TASKS.values():
-            if task.get("status") != "running":
+            if task.get("status") not in {"running", "pause_pending", "paused"}:
                 continue
             for account_id in task.get("remaining_account_ids", task.get("account_ids", [])):
                 active_status[account_id] = "queued"
@@ -487,7 +488,7 @@ def _active_account_ids() -> set[str]:
     with _TASK_LOCK:
         active = set()
         for task in TASKS.values():
-            if task.get("status") == "running":
+            if task.get("status") in {"running", "pause_pending", "paused"}:
                 active.update(task.get("reserved_account_ids", task.get("account_ids", [])))
         return active
 
@@ -697,6 +698,98 @@ def api_key(serial: str, key) -> dict:
     with _state_lock:
         out = adb_text("-s", serial, "shell", "input", "keyevent", str(int(key)), timeout=8)
         return {"ok": True, "message": out.strip() or f"已按键 {key}"}
+
+
+def api_input_text(serial: str, text_value: str) -> dict:
+    """向设备输入文字；优先使用 ADB Keyboard，ASCII 使用系统 input 回退。"""
+    serial = str(serial or "").strip()
+    text_value = str(text_value or "")
+    if not serial:
+        return {"ok": False, "message": "缺少设备序列号"}
+    if not text_value:
+        return {"ok": False, "message": "请输入要发送的文字"}
+    ime_list = shell(serial, "ime list -s", timeout=6)
+    if "com.android.adbkeyboard" in ime_list.lower():
+        encoded = base64.b64encode(text_value.encode("utf-8")).decode("ascii")
+        out = adb_text(
+            "-s", serial, "shell", "am", "broadcast",
+            "-a", "ADB_INPUT_B64", "--es", "msg", encoded,
+            timeout=8,
+        )
+        return {"ok": True, "message": out.strip() or "文字已发送"}
+    if not text_value.isascii():
+        return {
+            "ok": False,
+            "message": "该设备未启用 ADB Keyboard；中文请在本地 scrcpy 窗口中通过剪贴板粘贴",
+        }
+    encoded = text_value.replace("%", "\\%").replace(" ", "%s")
+    out = adb_text("-s", serial, "shell", "input", "text", encoded, timeout=8)
+    return {"ok": True, "message": out.strip() or "文字已输入"}
+
+
+_QUICK_KEYCODES = {
+    "home": 3,
+    "back": 4,
+    "power": 26,
+    "volume_up": 24,
+    "volume_down": 25,
+    "volume_mute": 164,
+    "recent": 187,
+    "wake": 224,
+    "sleep": 223,
+}
+
+
+def api_quick_control(serial: str, action: str, value=None) -> dict:
+    """执行经过白名单限制的设备快捷控制。"""
+    serial = str(serial or "").strip()
+    action = str(action or "").strip().lower()
+    if not serial:
+        return {"ok": False, "message": "缺少设备序列号"}
+    if action in _QUICK_KEYCODES:
+        return api_key(serial, _QUICK_KEYCODES[action])
+    commands = {
+        "notifications": ["cmd", "statusbar", "expand-notifications"],
+        "quick_settings": ["cmd", "statusbar", "expand-settings"],
+        "collapse_panels": ["cmd", "statusbar", "collapse"],
+        "rotate_auto": ["settings", "put", "system", "accelerometer_rotation", "1"],
+    }
+    if action in {"rotate_portrait", "rotate_landscape"}:
+        adb_text(
+            "-s", serial, "shell", "settings", "put", "system",
+            "accelerometer_rotation", "0", timeout=8,
+        )
+        rotation = "0" if action == "rotate_portrait" else "1"
+        out = adb_text(
+            "-s", serial, "shell", "settings", "put", "system",
+            "user_rotation", rotation, timeout=8,
+        )
+        return {"ok": True, "message": out.strip() or f"已执行 {action}"}
+    if action == "brightness":
+        try:
+            brightness = min(255, max(1, int(value)))
+        except (TypeError, ValueError):
+            return {"ok": False, "message": "亮度必须是 1 到 255 的整数"}
+        commands[action] = ["settings", "put", "system", "screen_brightness", str(brightness)]
+    command = commands.get(action)
+    if not command:
+        return {"ok": False, "message": f"不支持的快捷操作: {action}"}
+    out = adb_text("-s", serial, "shell", *command, timeout=8)
+    return {"ok": True, "message": out.strip() or f"已执行 {action}"}
+
+
+def api_device_clipboard(serial: str, operation: str, text_value: str = "") -> dict:
+    """提供剪贴板入口；scrcpy 会负责可靠的双向同步，ADB 命令作为兼容回退。"""
+    operation = str(operation or "").lower()
+    if operation == "set":
+        return api_input_text(serial, text_value)
+    if operation == "get":
+        out = shell(serial, "cmd clipboard get", timeout=6).strip()
+        unsupported = not out or any(marker in out.lower() for marker in ("unknown command", "not found", "exception"))
+        if unsupported:
+            return {"ok": False, "message": "该 Android 版本不开放 ADB 剪贴板读取；请使用本地 scrcpy 的双向剪贴板"}
+        return {"ok": True, "text": out, "message": "已读取手机剪贴板"}
+    return {"ok": False, "message": "不支持的剪贴板操作"}
 
 
 def api_dump_ui_elements(serial: str) -> dict:
@@ -916,6 +1009,26 @@ def _mark_account_finished(account_id: str, serial: str, success: bool, error: s
         _write_account_state_unlocked(state)
 
 
+def _wait_task_if_paused(task: dict) -> bool:
+    """在账号/循环边界安全暂停；返回 False 表示任务已停止。"""
+    pause_event = task.get("pause_event")
+    if pause_event is None:
+        return not task["stop_event"].is_set()
+    announced = False
+    while pause_event.is_set() and not task["stop_event"].is_set():
+        if not announced:
+            _append_task_line(task, "[系统] 设备任务已在安全边界暂停")
+            announced = True
+        with _TASK_LOCK:
+            task["status"] = "paused"
+        task["stop_event"].wait(0.25)
+    if announced and not task["stop_event"].is_set():
+        _append_task_line(task, "[系统] 设备任务已继续")
+        with _TASK_LOCK:
+            task["status"] = "running"
+    return not task["stop_event"].is_set()
+
+
 def _run_device_queue(task: dict, account_ids: list[str], settings: dict) -> None:
     serial = task["serial"]
     failures = 0
@@ -931,22 +1044,25 @@ def _run_device_queue(task: dict, account_ids: list[str], settings: dict) -> Non
         task,
         f"[系统] 结果截图: {'启用' if settings.get('capture_screenshot') else '未启用'}",
     )
-    for queue_index, account_id in enumerate(account_ids, 1):
-        if task["stop_event"].is_set():
+    queue_index = 0
+    while queue_index < len(account_ids):
+        account_id = account_ids[queue_index]
+        if not _wait_task_if_paused(task):
             break
         record = _account_snapshot(account_id)
         if not record or not record.get("selected") or record.get("status") == "completed":
+            queue_index += 1
             continue
 
         with _TASK_LOCK:
             task["current_account_id"] = account_id
             task["current_phone"] = record["phone"]
-            task["progress"] = queue_index
+            task["progress"] = queue_index + 1
         _mark_account_started(account_id, serial)
         _append_task_line(task, "-" * 60)
         _append_task_line(
             task,
-            f"[系统] 开始账号 {queue_index}/{len(account_ids)}: {record['phone']} | 设备: {serial}",
+            f"[系统] 开始账号 {queue_index + 1}/{len(account_ids)}: {record['phone']} | 设备: {serial}",
         )
 
         account_settings = dict(settings)
@@ -984,12 +1100,24 @@ def _run_device_queue(task: dict, account_ids: list[str], settings: dict) -> Non
                 task["proc"] = None
 
         stopped = task["stop_event"].is_set()
+        with _TASK_LOCK:
+            control_action = task.pop("control_action", "")
+        if control_action == "retry" and not stopped:
+            _append_task_line(task, f"[系统] 立即重试当前账号: {record['phone']}")
+            continue
+        if control_action == "skip" and not stopped:
+            _append_task_line(task, f"[系统] 已跳过当前账号并保留勾选: {record['phone']}")
+            with _TASK_LOCK:
+                if account_id in task.get("remaining_account_ids", []):
+                    task["remaining_account_ids"].remove(account_id)
+            queue_index += 1
+            continue
         success = return_code == 0 and not stopped
         if success:
             completed += 1
             _mark_account_finished(account_id, serial, True)
             _append_task_line(task, f"[系统] 账号完成并自动取消勾选: {record['phone']}")
-            if queue_index < len(account_ids):
+            if queue_index + 1 < len(account_ids):
                 _append_task_line(task, "[系统] 立即开始下一个账号；新流程第 1 步将清除 TapTap 数据")
         else:
             failures += 1
@@ -1005,6 +1133,7 @@ def _run_device_queue(task: dict, account_ids: list[str], settings: dict) -> Non
                 task["reserved_account_ids"].remove(account_id)
         if stopped:
             break
+        queue_index += 1
 
     with _TASK_LOCK:
         task["current_account_id"] = None
@@ -1091,6 +1220,8 @@ def _run_qq_device_task(task: dict, settings: dict) -> None:
     )
 
     while completed_cycles < target_cycles and not task["stop_event"].is_set():
+        if not _wait_task_if_paused(task):
+            break
         attempt += 1
         current_cycle = completed_cycles + 1
         with _TASK_LOCK:
@@ -1104,6 +1235,15 @@ def _run_qq_device_task(task: dict, settings: dict) -> None:
 
         cycle_succeeded = _run_qq_device_task_once(task, settings)
         stopped = task["stop_event"].is_set()
+        with _TASK_LOCK:
+            control_action = task.pop("control_action", "")
+        if control_action in {"retry", "skip"} and not stopped:
+            _append_task_line(
+                task,
+                "[系统] 当前 QQ 轮次已跳过，立即重新开始" if control_action == "skip"
+                else "[系统] 正在重试当前 QQ 轮次",
+            )
+            continue
         cycle_succeeded = cycle_succeeded and not stopped
 
         if cycle_succeeded:
@@ -1160,7 +1300,7 @@ def _start_qq_device_tasks(
     with _TASK_LOCK:
         busy = [
             serial for serial in requested
-            if TASKS.get(serial, {}).get("status") == "running"
+            if TASKS.get(serial, {}).get("status") in {"running", "pause_pending", "paused"}
         ]
         if busy:
             return {"ok": False, "message": "以下设备已有任务: " + ", ".join(busy)}
@@ -1178,6 +1318,8 @@ def _start_qq_device_tasks(
                 "ts": time.time(),
                 "proc": None,
                 "stop_event": threading.Event(),
+                "pause_event": threading.Event(),
+                "control_action": "",
                 "current_account_id": None,
                 "current_phone": "",
                 "progress": 0,
@@ -1296,13 +1438,13 @@ def api_task_run(
     with _TASK_LOCK:
         busy = [
             serial for serial in requested
-            if TASKS.get(serial, {}).get("status") == "running"
+            if TASKS.get(serial, {}).get("status") in {"running", "pause_pending", "paused"}
         ]
         if busy:
             return {"ok": False, "message": "以下设备已有任务: " + ", ".join(busy)}
         active_ids = set()
         for task in TASKS.values():
-            if task.get("status") == "running":
+            if task.get("status") in {"running", "pause_pending", "paused"}:
                 active_ids.update(task.get("reserved_account_ids", task.get("account_ids", [])))
 
         state = load_account_state()
@@ -1376,6 +1518,8 @@ def api_task_run(
                 "ts": time.time(),
                 "proc": None,
                 "stop_event": threading.Event(),
+                "pause_event": threading.Event(),
+                "control_action": "",
                 "current_account_id": None,
                 "current_phone": "",
                 "progress": 0,
@@ -1454,7 +1598,7 @@ def api_task_stop(serials=None) -> dict:
         for serial, task in TASKS.items():
             if requested and serial not in requested:
                 continue
-            if task["status"] != "running":
+            if task["status"] not in {"running", "pause_pending", "paused"}:
                 continue
             task["stop_event"].set()
             proc = task.get("proc")
@@ -1467,6 +1611,42 @@ def api_task_stop(serials=None) -> dict:
     if stopped:
         return {"ok": True, "message": f"已停止 {len(stopped)} 个设备任务", "serials": stopped}
     return {"ok": False, "message": "当前没有匹配的运行中任务"}
+
+
+def api_task_control(serial: str, action: str) -> dict:
+    """控制单台设备任务：安全暂停、继续、跳过当前项或重试当前项。"""
+    serial = str(serial or "").strip()
+    action = str(action or "").strip().lower()
+    if action not in {"pause", "resume", "skip", "retry"}:
+        return {"ok": False, "message": "不支持的任务控制操作"}
+    with _TASK_LOCK:
+        task = TASKS.get(serial)
+        if not task:
+            return {"ok": False, "message": "该设备还没有任务"}
+        if task.get("status") not in {"running", "pause_pending", "paused"}:
+            return {"ok": False, "message": "该设备任务已经结束"}
+        pause_event = task.get("pause_event")
+        if action == "pause":
+            pause_event.set()
+            task["status"] = "pause_pending" if task.get("proc") else "paused"
+            return {"ok": True, "message": "已请求暂停；当前步骤完成后进入安全暂停", "status": task["status"]}
+        if action == "resume":
+            pause_event.clear()
+            task["status"] = "running"
+            return {"ok": True, "message": "设备任务已继续", "status": "running"}
+        proc = task.get("proc")
+        if not proc:
+            return {"ok": False, "message": "当前没有可跳过或重试的运行步骤"}
+        task["control_action"] = action
+        try:
+            proc.kill()
+        except OSError:
+            task["control_action"] = ""
+            return {"ok": False, "message": "无法终止当前步骤"}
+    return {
+        "ok": True,
+        "message": "正在跳过当前步骤" if action == "skip" else "正在重启当前步骤",
+    }
 
 
 def api_task_clear_log(serial: str) -> dict:
@@ -1626,6 +1806,10 @@ class Handler(BaseHTTPRequestHandler):
             ))
         if path == "/api/task/stop":
             return self._send_json(api_task_stop(data.get("serials") or data.get("serial")))
+        if path == "/api/task/control":
+            return self._send_json(api_task_control(
+                data.get("serial", ""), data.get("action", ""),
+            ))
         if path == "/api/task/log/clear":
             return self._send_json(api_task_clear_log(data.get("serial", "")))
         if path == "/api/settings":
@@ -1658,7 +1842,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(api_tcpip(data.get("serial", "")))
 
         # 屏幕输入控制与本地预览：/api/devices/<serial>/...
-        m = re.fullmatch(r"/api/devices/([^/]+)/(tap|swipe|key|dump-ui|native-preview)", path)
+        m = re.fullmatch(
+            r"/api/devices/([^/]+)/(tap|swipe|key|text|clipboard|quick|dump-ui|native-preview)",
+            path,
+        )
         if m:
             serial = urllib.parse.unquote(m.group(1))
             action = m.group(2)
@@ -1671,6 +1858,16 @@ class Handler(BaseHTTPRequestHandler):
                 ))
             if action == "key":
                 return self._send_json(api_key(serial, data.get("key")))
+            if action == "text":
+                return self._send_json(api_input_text(serial, data.get("text", "")))
+            if action == "clipboard":
+                return self._send_json(api_device_clipboard(
+                    serial, data.get("operation", ""), data.get("text", ""),
+                ))
+            if action == "quick":
+                return self._send_json(api_quick_control(
+                    serial, data.get("action", ""), data.get("value"),
+                ))
             if action == "dump-ui":
                 return self._send_json(api_dump_ui_elements(serial))
             if action == "native-preview":
