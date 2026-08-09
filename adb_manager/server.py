@@ -52,6 +52,10 @@ try:
     from . import toolkit as device_toolkit
 except ImportError:  # 直接运行 adb_manager/server.py 时使用同目录模块
     import toolkit as device_toolkit
+try:
+    from . import emulator_manager
+except ImportError:
+    import emulator_manager
 
 # 运行自动化脚本用的 Python：优先使用项目 venv
 _VENV_PY = os.path.join(PROJECT_DIR, ".venv", "Scripts", "python.exe")
@@ -199,7 +203,11 @@ def find_scrcpy(explicit: str | None = None) -> str | None:
     return None
 
 
-def api_open_native_preview(serial: str, virtual_display: bool = False) -> dict:
+def api_open_native_preview(
+    serial: str,
+    virtual_display: bool = False,
+    always_on_top: bool = False,
+) -> dict:
     """为指定在线设备打开独立本地预览窗口，优先使用 scrcpy。"""
     serial = str(serial or "").strip()
     if not serial:
@@ -212,7 +220,7 @@ def api_open_native_preview(serial: str, virtual_display: bool = False) -> dict:
         for device, process in list(_native_preview_processes.items()):
             if process.poll() is not None:
                 _native_preview_processes.pop(device, None)
-        process_key = serial + ("::virtual" if virtual_display else "::main")
+        process_key = serial + ("::virtual" if virtual_display else "::main") + ("::top" if always_on_top else "")
         existing = _native_preview_processes.get(process_key)
         if existing and existing.poll() is None:
             return {"ok": True, "message": "该设备的本地预览窗口已经打开", "mode": "existing"}
@@ -226,6 +234,8 @@ def api_open_native_preview(serial: str, virtual_display: bool = False) -> dict:
             ]
             if virtual_display:
                 command.extend(["--new-display", "--no-audio"])
+            if always_on_top:
+                command.append("--always-on-top")
             mode = "scrcpy"
             cwd = os.path.dirname(scrcpy_path)
         else:
@@ -1814,6 +1824,10 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 offsets = {}
             return self._send_json(device_toolkit.plugin_tasks(offsets))
+        if path == "/api/emulator/status":
+            return self._send_json(emulator_manager.install_state())
+        if path == "/api/emulator/profiles":
+            return self._send_json(emulator_manager.profiles_list())
 
         if path == "/api/task":
             offset = 0
@@ -1934,6 +1948,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(device_toolkit.plugin_run(data.get("serials", []), data.get("plugin_ids")))
         if path == "/api/plugins/stop":
             return self._send_json(device_toolkit.plugin_stop(data.get("task_ids")))
+        if path == "/api/emulator/install":
+            return self._send_json(emulator_manager.install_runtime())
+        if path == "/api/emulator/create":
+            return self._send_json(emulator_manager.create_profile(data))
+        if path == "/api/emulator/update":
+            return self._send_json(emulator_manager.update_profile(data))
+        if path == "/api/emulator/action":
+            return self._send_json(emulator_manager.profile_action(data.get("name", ""), data.get("action", "")))
         if path == "/api/settings":
             return self._send_json(api_settings_save(data))
         if path == "/api/accounts/import":
@@ -1978,7 +2000,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(device_toolkit.logcat_control(serial, data.get("action", "")))
             if action == "inspect-ui":
                 return self._send_json(api_dump_ui_elements(serial, include_elements=True))
-            return self._send_json(api_open_native_preview(serial, virtual_display=True))
+            return self._send_json(api_open_native_preview(
+                serial,
+                virtual_display=True,
+                always_on_top=data.get("always_on_top") is True,
+            ))
 
         # 屏幕输入控制与本地预览：/api/devices/<serial>/...
         m = re.fullmatch(
@@ -2010,7 +2036,11 @@ class Handler(BaseHTTPRequestHandler):
             if action == "dump-ui":
                 return self._send_json(api_dump_ui_elements(serial))
             if action == "native-preview":
-                return self._send_json(api_open_native_preview(serial, data.get("virtual_display") is True))
+                return self._send_json(api_open_native_preview(
+                    serial,
+                    data.get("virtual_display") is True,
+                    data.get("always_on_top") is True,
+                ))
 
         self._send_json({"error": "not found"}, 404)
 
@@ -2053,6 +2083,7 @@ def main():
 
     subprocess.run([ADB_PATH, "start-server"], capture_output=True, timeout=10)
     device_toolkit.configure(ADB_PATH, BASE_DIR)
+    emulator_manager.configure(ADB_PATH, PROJECT_DIR)
     os.environ["PYTHON_EXECUTABLE"] = PYTHON_PATH
     SCRCPY_PATH = find_scrcpy(args.scrcpy)
     print(f"[OK] 使用 adb: {ADB_PATH}")

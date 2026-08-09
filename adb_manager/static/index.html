@@ -912,7 +912,7 @@ async function openNativePreview(serial, button) {
   try {
     const data = await apiPost(
       "/api/devices/" + encodeURIComponent(serial) + "/native-preview",
-      {}
+      { always_on_top: localStorage.getItem("previewAlwaysOnTop") === "1" }
     );
     if (data && data.ok) {
       const mode = data.mode === "scrcpy" ? "scrcpy" : "本地程序";
@@ -1957,5 +1957,6 @@ pollTasks();
 </script>
 <script src="/static/phase1_controls.js"></script>
 <script src="/static/device_toolkit.js"></script>
+<script src="/static/emulator_panel.js"></script>
 </body>
 </html>
