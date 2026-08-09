@@ -632,6 +632,7 @@ function cardHtml(d) {
   let actions = "";
   if (online) {
     actions += '<button class="btn" data-act="log" data-serial="' + esc(d.serial) + '">设备日志</button>';
+    actions += '<button class="btn" data-act="dumpui" data-serial="' + esc(d.serial) + '">打印页面元素</button>';
     actions += '<button class="btn" data-act="preview" data-serial="' + esc(d.serial) + '">实时预览</button>';
     actions += '<button class="btn" data-act="shot" data-serial="' + esc(d.serial) + '">截图</button>';
     if (d.type === "USB") {
@@ -775,6 +776,21 @@ function replaceImageBlob(img, blob) {
   img.src = newUrl;
   img.dataset.objectUrl = newUrl;
   if (oldUrl) URL.revokeObjectURL(oldUrl);
+}
+
+async function dumpUiElements(serial, button) {
+  if (button) button.disabled = true;
+  try {
+    const data = await apiPost(
+      "/api/devices/" + encodeURIComponent(serial) + "/dump-ui",
+      {}
+    );
+    if (data && data.ok) {
+      toast("✓ " + data.message + " · ui_dumps/" + data.filename, "ok");
+    }
+  } finally {
+    if (button) button.disabled = false;
+  }
 }
 
 function clearImageBlob(img) {
@@ -1439,7 +1455,8 @@ grid.addEventListener("click", e => {
   if (!btn) return;
   const act = btn.dataset.act;
   const serial = btn.dataset.serial;
-  if (act === "log") {
+  if (act === "dumpui") dumpUiElements(serial, btn);
+  else if (act === "log") {
     activeLogSerial = serial;
     if (!taskStates.some(task => task.serial === serial)) {
       toast("该设备还没有任务日志", "err");

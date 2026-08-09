@@ -851,11 +851,18 @@ def _input_text_is_present(elements, expected: str) -> bool:
     return False
 
 
-def input_text_verified(input_elem, value: str, *, clear: bool = True) -> bool:
+def input_text_verified(
+    input_elem,
+    value: str,
+    *,
+    clear: bool = True,
+    accept_hidden: bool = False,
+) -> bool:
     """输入普通文本并从 UI 读回验证，不成功则返回 False。"""
     _tap_elem(input_elem)
     time.sleep(CLICK_SETTLE_DELAY)
     original_ime = None
+    primary_command_succeeded = False
     try:
         original_ime = detect_and_set_adb_keyboard(DEVICE_ID)
         time.sleep(CLICK_SETTLE_DELAY)
@@ -863,6 +870,7 @@ def input_text_verified(input_elem, value: str, *, clear: bool = True) -> bool:
             clear_text(DEVICE_ID)
             time.sleep(0.1)
         type_text(value, DEVICE_ID)
+        primary_command_succeeded = True
         time.sleep(0.5)
     except Exception as exc:
         print(f"    [WARN] 文本输入命令失败: {exc}")
@@ -873,7 +881,12 @@ def input_text_verified(input_elem, value: str, *, clear: bool = True) -> bool:
             except Exception:
                 pass
 
-    if _input_text_is_present(get_ui_elements_safe(DEVICE_ID), value):
+    after_primary_input = get_ui_elements_safe(DEVICE_ID)
+    if _input_text_is_present(after_primary_input, value):
+        return True
+    if accept_hidden and primary_command_succeeded and verification_code_input_hides_value(
+        after_primary_input, input_elem, value
+    ):
         return True
 
     # 纯 ASCII 文本可使用系统 input text 作为回退。
@@ -886,9 +899,47 @@ def input_text_verified(input_elem, value: str, *, clear: bool = True) -> bool:
                 pass
         result = adb_cmd("shell", "input", "text", value, timeout=8)
         time.sleep(0.5)
-        if result.returncode == 0 and _input_text_is_present(
-            get_ui_elements_safe(DEVICE_ID), value
-        ):
+        after_fallback_input = get_ui_elements_safe(DEVICE_ID)
+        if result.returncode == 0:
+            if _input_text_is_present(after_fallback_input, value):
+                return True
+            if accept_hidden and verification_code_input_hides_value(
+                after_fallback_input, input_elem, value
+            ):
+                return True
+    return False
+
+
+def verification_code_input_hides_value(elements, input_elem, code: str) -> bool:
+    """识别不会在 UI XML 中回传验证码明文的安全输入控件。"""
+    if not code.isdigit() or len(code) != 6:
+        return False
+    target_id = (input_elem.resource_id or "").lower()
+    markers = ("item_edittext", "verify", "verification", "sms", "code", "captcha")
+    candidates = [
+        elem for elem in elements
+        if "EditText" in (elem.class_name or "")
+        and (
+            (target_id and (elem.resource_id or "").lower() == target_id)
+            or elem.rect == input_elem.rect
+        )
+    ]
+    if not candidates:
+        # 输入满 6 位后部分页面会自动提交并移除输入框，由步骤 12 继续验证页面状态。
+        return is_username_or_home_page(elements)
+    for elem in candidates:
+        resource_id = (elem.resource_id or "").lower()
+        description = str(getattr(elem, "content_description", "") or "")
+        visible_value = (elem.text or "") + description
+        digits = re.sub(r"\D", "", visible_value)
+        if digits.endswith(code):
+            return True
+        masked_count = sum(visible_value.count(char) for char in ("•", "●", "*"))
+        if masked_count >= len(code):
+            return True
+        if any(marker in resource_id for marker in markers) and not visible_value.strip():
+            return True
+        if bool(getattr(elem, "password", False)):
             return True
     return False
 
@@ -1967,10 +2018,13 @@ def main():
     if not code_inputs:
         print("    [FAIL] 第 11 步失败：未找到验证码输入框")
         return
-    if not input_text_verified(code_inputs[0], code):
-        print("    [FAIL] 第 11 步失败：验证码未能从输入框读回确认")
+    if not input_text_verified(code_inputs[0], code, accept_hidden=True):
+        print("    [FAIL] 第 11 步失败：验证码输入后控件状态未发生有效变化")
         return
-    print(f"    [OK] 验证码已输入并读回验证: {code}")
+    print(
+        "    [OK] 验证码输入已通过明文、隐藏输入状态或页面跳转验证；"
+        "第 12 步将继续确认提交结果"
+    )
 
     time.sleep(CLICK_SETTLE_DELAY)
 

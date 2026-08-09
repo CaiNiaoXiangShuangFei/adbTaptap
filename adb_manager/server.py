@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -56,6 +57,7 @@ SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 ACCOUNTS_DIR = os.path.join(BASE_DIR, "accounts")
 ACCOUNT_STATE_PATH = os.path.join(BASE_DIR, "account_queue.json")
 DEVICE_LOGS_DIR = os.path.join(BASE_DIR, "device_logs")
+UI_DUMPS_DIR = os.path.join(BASE_DIR, "ui_dumps")
 DEFAULT_SETTINGS = {
     "country": DEFAULT_PHONE_COUNTRY,
     "sms_api_url": DEFAULT_SMS_API_URL,
@@ -73,6 +75,7 @@ _state_lock = threading.Lock()
 _screenshot_lock = threading.Lock()
 _settings_lock = threading.Lock()
 _account_lock = threading.RLock()
+_ui_dump_lock = threading.Lock()
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
@@ -575,6 +578,105 @@ def api_key(serial: str, key) -> dict:
     with _state_lock:
         out = adb_text("-s", serial, "shell", "input", "keyevent", str(int(key)), timeout=8)
         return {"ok": True, "message": out.strip() or f"已按键 {key}"}
+
+
+def api_dump_ui_elements(serial: str) -> dict:
+    """抓取指定设备当前 UI 层级，并按逐元素 JSON 格式保存日志。"""
+    serial = str(serial or "").strip()
+    if not serial:
+        return {"ok": False, "message": "缺少设备序列号"}
+    remote_path = "/sdcard/window_dump.xml"
+    with _ui_dump_lock:
+        dump_result = adb(
+            "-s", serial, "shell", "uiautomator", "dump", "--compressed", remote_path,
+            timeout=20,
+        )
+        if not dump_result or dump_result.returncode != 0:
+            # 少数旧版 Android 不支持 --compressed，自动回退普通 dump。
+            dump_result = adb(
+                "-s", serial, "shell", "uiautomator", "dump", remote_path,
+                timeout=20,
+            )
+        if not dump_result or dump_result.returncode != 0:
+            message = ""
+            if dump_result:
+                message = ((dump_result.stdout or "") + (dump_result.stderr or "")).strip()
+            return {"ok": False, "message": "页面元素获取失败: " + (message or "设备无响应")}
+        xml_result = adb("-s", serial, "exec-out", "cat", remote_path, timeout=12)
+        if not xml_result or xml_result.returncode != 0:
+            message = ""
+            if xml_result:
+                message = ((xml_result.stdout or "") + (xml_result.stderr or "")).strip()
+            return {"ok": False, "message": "UI XML 读取失败: " + (message or "设备无响应")}
+
+        xml_text = (xml_result.stdout or "").strip()
+        xml_start = xml_text.find("<hierarchy")
+        declaration_start = xml_text.find("<?xml")
+        if declaration_start >= 0:
+            xml_text = xml_text[declaration_start:]
+        elif xml_start >= 0:
+            xml_text = xml_text[xml_start:]
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as exc:
+            return {"ok": False, "message": f"UI XML 解析失败: {exc}"}
+
+        captured_at = time.strftime("%Y-%m-%dT%H:%M:%S") + f".{int(time.time() % 1 * 1000):03d}"
+        timestamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() % 1 * 1000):03d}"
+        safe_serial = re.sub(r"[^0-9A-Za-z._-]+", "_", serial).strip("._")[:90] or "device"
+        filename = f"{safe_serial}_{timestamp}.log"
+        os.makedirs(UI_DUMPS_DIR, exist_ok=True)
+        path = os.path.join(UI_DUMPS_DIR, filename)
+        nodes = list(root.iter("node"))
+        try:
+            with open(path, "w", encoding="utf-8") as file:
+                file.write(
+                    f"[UI-ELEMENTS-BEGIN] device={serial} captured_at={captured_at} count={len(nodes)}\n"
+                )
+                for index, node in enumerate(nodes):
+                    attributes = dict(node.attrib)
+                    bounds = attributes.get("bounds", "")
+                    bounds_match = re.fullmatch(
+                        r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]", bounds
+                    )
+                    element = {
+                        "index": index,
+                        "resource_id": attributes.get("resource-id") or None,
+                        "text": attributes.get("text") or "",
+                        "content_description": attributes.get("content-desc") or None,
+                        "class_name": attributes.get("class") or None,
+                        "rect": [int(value) for value in bounds_match.groups()] if bounds_match else None,
+                        "bounds": bounds or None,
+                        "clickable": attributes.get("clickable") == "true",
+                        "enabled": attributes.get("enabled") == "true",
+                        "checkable": attributes.get("checkable") == "true",
+                        "checked": attributes.get("checked") == "true",
+                        "focusable": attributes.get("focusable") == "true",
+                        "focused": attributes.get("focused") == "true",
+                        "selected": attributes.get("selected") == "true",
+                        "scrollable": attributes.get("scrollable") == "true",
+                        "password": attributes.get("password") == "true",
+                        "attributes": attributes,
+                    }
+                    file.write(
+                        "[UI-ELEMENT] "
+                        + json.dumps(element, ensure_ascii=False, separators=(",", ":"))
+                        + "\n"
+                    )
+                file.write(f"[UI-ELEMENTS-END] device={serial} count={len(nodes)}\n")
+        except OSError as exc:
+            return {"ok": False, "message": f"页面元素日志保存失败: {exc}"}
+
+    print(f"[UI] 设备 {serial} 当前页面元素已保存: {path} ({len(nodes)} 个)")
+    return {
+        "ok": True,
+        "message": f"已保存 {len(nodes)} 个页面元素",
+        "serial": serial,
+        "count": len(nodes),
+        "filename": filename,
+        "folder": UI_DUMPS_DIR,
+        "path": path,
+    }
 
 
 # ============ 自动化任务（运行 taptap_auto_login.py） ============
@@ -1124,7 +1226,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(api_tcpip(data.get("serial", "")))
 
         # 屏幕输入控制：/api/devices/<serial>/tap|swipe|key
-        m = re.fullmatch(r"/api/devices/([^/]+)/(tap|swipe|key)", path)
+        m = re.fullmatch(r"/api/devices/([^/]+)/(tap|swipe|key|dump-ui)", path)
         if m:
             serial = urllib.parse.unquote(m.group(1))
             action = m.group(2)
@@ -1137,6 +1239,8 @@ class Handler(BaseHTTPRequestHandler):
                 ))
             if action == "key":
                 return self._send_json(api_key(serial, data.get("key")))
+            if action == "dump-ui":
+                return self._send_json(api_dump_ui_elements(serial))
 
         self._send_json({"error": "not found"}, 404)
 
