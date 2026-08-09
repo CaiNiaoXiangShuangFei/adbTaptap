@@ -104,7 +104,12 @@
   .log-tab.active { color: var(--text); border-color: var(--blue); background: rgba(59, 130, 246, .12); }
   .log-tab.running::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: var(--green); }
   .device-task-check { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; cursor: pointer; }
-  .device-task-check input, .account-table input[type="checkbox"] { accent-color: var(--blue); width: 15px; height: 15px; }
+  .device-task-check input, .device-flow-options input, .account-table input[type="checkbox"] { accent-color: var(--blue); width: 15px; height: 15px; }
+  .device-flow-options {
+    display: flex; gap: 12px; flex-wrap: wrap; padding: 9px 10px;
+    border: 1px solid var(--line); border-radius: 9px; background: rgba(3,10,25,.2);
+  }
+  .device-flow-options label { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; cursor: pointer; }
   .card.device-selected { border-color: var(--blue); box-shadow: 0 0 0 1px rgba(59, 130, 246, .2); }
   .settings-card {
     width: min(680px, 94vw); max-height: 88vh; overflow: auto; background: var(--card);
@@ -463,13 +468,6 @@
     <h2>自动化任务</h2>
     <div class="task-config">
       <div class="config-field">
-        <label for="taskFlowType">任务流程</label>
-        <select id="taskFlowType" title="选择自动化任务流程">
-          <option value="new_account">新号全流程</option>
-          <option value="qq">QQ号全流程</option>
-        </select>
-      </div>
-      <div class="config-field">
         <label for="taskGameName">游戏名</label>
         <input class="settings-input" id="taskGameName" value="我的休闲时光" maxlength="100" autocomplete="off" spellcheck="false" placeholder="请输入需要搜索和下载的游戏名">
         <div class="settings-hint">
@@ -623,6 +621,7 @@ const lastRefresh = document.getElementById("lastRefresh");
 const deviceCount = document.getElementById("deviceCount");
 let latestDevices = [];
 const selectedDevices = new Set();
+const deviceFlowTypes = new Map();
 
 // ---------- 设备列表 ----------
 async function loadDevices() {
@@ -634,7 +633,7 @@ async function loadDevices() {
     [...selectedDevices].forEach(serial => { if (!onlineSerials.has(serial)) selectedDevices.delete(serial); });
     render(latestDevices);
     renderAccounts();
-    updateRunControls();
+    updateFlowUI();
     lastRefresh.textContent = "最后刷新 " + new Date().toLocaleTimeString();
   } catch (e) {
     toast("刷新失败：" + e.message, "err");
@@ -660,6 +659,7 @@ function stateBadge(state) {
 function cardHtml(d) {
   const online = d.state === "device";
   const selected = online && selectedDevices.has(d.serial);
+  const flowType = deviceFlowTypes.get(d.serial) || "new_account";
   const title = d.model || d.brand || "Android 设备";
   const rows = [];
   const addRow = (k, v) => { if (v) rows.push("<dt>" + k + "</dt><dd>" + esc(v) + "</dd>"); };
@@ -699,6 +699,10 @@ function cardHtml(d) {
         <input type="checkbox" data-device-check="${esc(d.serial)}" ${selected ? "checked" : ""} ${online ? "" : "disabled"}>
         参与批量任务
       </label>
+      <div class="device-flow-options" role="radiogroup" aria-label="${esc(title)}任务流程">
+        <label><input type="radio" name="flow-${esc(d.serial)}" data-device-flow="${esc(d.serial)}" value="new_account" ${flowType === "new_account" ? "checked" : ""} ${online ? "" : "disabled"}>新号全流程</label>
+        <label><input type="radio" name="flow-${esc(d.serial)}" data-device-flow="${esc(d.serial)}" value="qq" ${flowType === "qq" ? "checked" : ""} ${online ? "" : "disabled"}>QQ号全流程</label>
+      </div>
       ${rows.length ? '<dl class="meta">' + rows.join("") + "</dl>" : ""}
       ${actions ? '<div class="actions">' + actions + "</div>" : ""}
     </div>`;
@@ -1255,36 +1259,47 @@ const logTaskIds = new Map();
 async function runTask() {
   const serials = [...selectedDevices];
   const gameName = document.getElementById("taskGameName").value.trim();
-  const flowType = document.getElementById("taskFlowType").value;
   const captureScreenshot = document.getElementById("taskCaptureScreenshot").checked;
+  const newAccountSerials = serials.filter(serial => (deviceFlowTypes.get(serial) || "new_account") === "new_account");
+  const qqSerials = serials.filter(serial => deviceFlowTypes.get(serial) === "qq");
   if (!serials.length) { toast("请至少勾选一台在线设备", "err"); return; }
   if (!gameName) { toast("请输入游戏名", "err"); return; }
-  if (flowType === "new_account" && !accountQueue.some(account => account.selected && account.status !== "completed")) {
+  if (newAccountSerials.length && !accountQueue.some(account => account.selected && account.status !== "completed")) {
     toast("请至少勾选一个未完成账号", "err");
     return;
   }
   const btn = document.getElementById("btnRunTask");
   btn.disabled = true;
   try {
-    const res = await fetch("/api/task/run", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        serials,
-        game_name: gameName,
-        flow_type: flowType,
-        capture_screenshot: captureScreenshot,
-      })
-    });
-    const data = await res.json();
-    toast((data.ok ? "✓ " : "✗ ") + data.message, data.ok ? "ok" : "err");
-    if (data.ok) {
-      (data.serials || []).forEach(serial => {
+    const startFlow = async (flowSerials, flowType) => {
+      if (!flowSerials.length) return null;
+      const res = await fetch("/api/task/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          serials: flowSerials,
+          game_name: gameName,
+          flow_type: flowType,
+          capture_screenshot: captureScreenshot,
+        })
+      });
+      return res.json();
+    };
+    const results = (await Promise.all([
+      startFlow(newAccountSerials, "new_account"),
+      startFlow(qqSerials, "qq"),
+    ])).filter(Boolean);
+    const startedSerials = results.flatMap(data => data.ok ? (data.serials || []) : []);
+    const messages = results.map(data => (data.ok ? "✓ " : "✗ ") + data.message);
+    const allOk = results.every(data => data.ok);
+    toast(messages.join("；"), allOk ? "ok" : "err");
+    if (startedSerials.length) {
+      startedSerials.forEach(serial => {
         logOffsets.set(serial, 0);
         logBuffers.set(serial, "");
         logTaskIds.delete(serial);
       });
-      activeLogSerial = (data.serials || [])[0] || activeLogSerial;
+      activeLogSerial = startedSerials[0] || activeLogSerial;
       pollTasks();
     } else {
       updateRunControls();
@@ -1395,21 +1410,28 @@ function updateRunControls() {
   const runnableAccounts = accountQueue.some(account => account.selected && !["completed", "queued", "running"].includes(account.status));
   const running = taskStates.some(task => task.status === "running");
   const hasGameName = !!document.getElementById("taskGameName").value.trim();
-  const isQqFlow = document.getElementById("taskFlowType").value === "qq";
-  runBtn.disabled = !selectedDevices.size || (!isQqFlow && !runnableAccounts) || !hasGameName;
+  const hasSelectedNewAccountDevice = [...selectedDevices].some(
+    serial => (deviceFlowTypes.get(serial) || "new_account") === "new_account"
+  );
+  runBtn.disabled = !selectedDevices.size || (hasSelectedNewAccountDevice && !runnableAccounts) || !hasGameName;
   stopBtn.disabled = !running;
   const online = latestDevices.filter(device => device.state === "device");
   document.getElementById("btnSelectOnlineDevices").textContent =
     online.length && online.every(device => selectedDevices.has(device.serial)) ?
       "取消勾选全部设备" : "勾选全部在线设备";
+  const selectedNewCount = [...selectedDevices].filter(serial => (deviceFlowTypes.get(serial) || "new_account") === "new_account").length;
+  const selectedQqCount = selectedDevices.size - selectedNewCount;
   document.getElementById("selectedDeviceSummary").textContent = selectedDevices.size ?
-    "已勾选 " + selectedDevices.size + " 台设备；自动账号将均衡分配" : "未勾选设备";
+    "已勾选 " + selectedDevices.size + " 台设备；新号 " + selectedNewCount + " 台，QQ " + selectedQqCount + " 台" : "未勾选设备";
 }
 
 function updateFlowUI() {
-  const isQqFlow = document.getElementById("taskFlowType").value === "qq";
-  document.getElementById("accountFileConfig").hidden = isQqFlow;
-  document.getElementById("accountTableWrap").hidden = isQqFlow;
+  const hasSelectedNewAccountDevice = [...selectedDevices].some(
+    serial => (deviceFlowTypes.get(serial) || "new_account") === "new_account"
+  );
+  const hideAccounts = selectedDevices.size > 0 && !hasSelectedNewAccountDevice;
+  document.getElementById("accountFileConfig").hidden = hideAccounts;
+  document.getElementById("accountTableWrap").hidden = hideAccounts;
   updateRunControls();
 }
 
@@ -1675,7 +1697,6 @@ document.getElementById("qrModal").addEventListener("click", e => {
 });
 document.getElementById("taskCountry").addEventListener("change", saveCountry);
 document.getElementById("taskGameName").addEventListener("input", updateRunControls);
-document.getElementById("taskFlowType").addEventListener("change", updateFlowUI);
 document.getElementById("btnChooseAccount").addEventListener("click", () => {
   document.getElementById("accountFile").click();
 });
@@ -1710,7 +1731,7 @@ document.getElementById("btnSelectOnlineDevices").addEventListener("click", () =
   const allSelected = online.length && online.every(device => selectedDevices.has(device.serial));
   online.forEach(device => allSelected ? selectedDevices.delete(device.serial) : selectedDevices.add(device.serial));
   render(latestDevices);
-  updateRunControls();
+  updateFlowUI();
 });
 document.getElementById("logTabs").addEventListener("click", e => {
   const tab = e.target.closest("[data-log-serial]");
@@ -1746,12 +1767,18 @@ grid.addEventListener("click", e => {
   else if (act === "disc") doDisconnect(serial);
 });
 grid.addEventListener("change", e => {
+  const flow = e.target.closest("[data-device-flow]");
+  if (flow) {
+    deviceFlowTypes.set(flow.dataset.deviceFlow, flow.value);
+    updateFlowUI();
+    return;
+  }
   const checkbox = e.target.closest("[data-device-check]");
   if (!checkbox) return;
   if (checkbox.checked) selectedDevices.add(checkbox.dataset.deviceCheck);
   else selectedDevices.delete(checkbox.dataset.deviceCheck);
   render(latestDevices);
-  updateRunControls();
+  updateFlowUI();
 });
 
 setInterval(() => {
