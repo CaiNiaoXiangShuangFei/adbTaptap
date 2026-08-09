@@ -1078,13 +1078,8 @@ def is_search_page(elements) -> bool:
         or any("EditText" in (elem.class_name or "") for elem in elements)
 
 
-def _game_search_input_is_empty(elements) -> bool:
-    input_elem = _find_element_by_id_candidates(elements, ["input_box"])
-    return input_elem is not None and not (input_elem.text or "").strip()
-
-
 def input_game_search_text(elements, game_name: str) -> bool:
-    """清除搜索框的历史词并输入游戏名，最终从 input_box 读回确认。"""
+    """必要时点击清除按钮，随后立即输入并验证游戏名。"""
     for attempt in range(1, 3):
         current_elements = elements if attempt == 1 else get_ui_elements_safe(DEVICE_ID)
         input_elem = _find_element_by_id_candidates(current_elements, ["input_box"])
@@ -1097,23 +1092,14 @@ def input_game_search_text(elements, game_name: str) -> bool:
         if _input_text_is_present(current_elements, game_name):
             return True
 
-        cleared = not bool((input_elem.text or "").strip())
+        clear_with_keyboard = bool((input_elem.text or "").strip())
         clear_button = _find_element_by_id_candidates(current_elements, ["clear_input"])
         if clear_button is not None:
             print(f"    [ACTION] 清除历史搜索词: {input_elem.text or '-'}")
             _tap_elem(clear_button, "清除历史搜索词")
-            cleared_elements = wait_for_ui_condition(
-                _game_search_input_is_empty,
-                timeout=1.5,
-            )
-            cleared = cleared_elements is not None
-            if cleared_elements:
-                current_elements = cleared_elements
-                input_elem = _find_element_by_id_candidates(current_elements, ["input_box"])
+            clear_with_keyboard = False
 
-        if not cleared:
-            print("    [WARN] 清除按钮未确认生效，使用输入法清空后覆盖...")
-        if input_text_verified(input_elem, game_name, clear=not cleared):
+        if input_text_verified(input_elem, game_name, clear=clear_with_keyboard):
             print(f"    [OK] 游戏名已输入并验证: {game_name}")
             return True
         if attempt < 2:
