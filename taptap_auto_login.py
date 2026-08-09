@@ -943,14 +943,20 @@ def find_supported_country_element(elements, preferred_country: str):
         "United States": ("United States", "美国"),
         "Canada": ("Canada", "加拿大"),
     }
+    matches = []
     for country in country_candidates(preferred_country):
         for label in labels[country]:
             elem = find_element_by_text(label, elements, exact_match=False)
             if elem:
-                return country, elem
+                matches.append((country, elem))
+                break
         elem = find_element_by_desc(country, elements, exact_match=False)
-        if elem:
-            return country, elem
+        if elem and not any(match_elem is elem for _, match_elem in matches):
+            matches.append((country, elem))
+
+    if matches:
+        # 两国同为 +1，不按名称设优先级；选择当前列表中位置最靠前的控件。
+        return min(matches, key=lambda match: (match[1].rect[1], match[1].rect[0]))
     return None, None
 
 
@@ -1709,7 +1715,7 @@ def main():
         print("    [FAIL] 第 6 步失败：无法打开国家列表")
         return
 
-    # 美国和加拿大均使用 +1；按设置顺序选择先找到的国家。
+    # 美国和加拿大均使用 +1 且同等优先；选择列表中先出现的任意一个。
     print(f"    搜索「{country_display}」...")
     found = False
     selected_country = None
@@ -1734,14 +1740,15 @@ def main():
     if not found:
         print(f"    [WARN] 未找到 {country_display}，尝试直接输入查找...")
         search_inputs = find_text_input_elements(get_ui_elements_safe(DEVICE_ID))
-        for country in preferred_countries:
-            if not search_inputs or not input_text_verified(search_inputs[0], country):
+        # 先搜索共同区号，若 TapTap 不支持按区号搜索，再分别按国家名查找。
+        for search_term in ["+1", *preferred_countries]:
+            if not search_inputs or not input_text_verified(search_inputs[0], search_term):
                 continue
             for _ in range(5):
                 elements = get_ui_elements_safe(DEVICE_ID)
                 selected_country, country_elem = find_supported_country_element(
                     elements,
-                    country,
+                    PHONE_COUNTRY,
                 )
                 if country_elem:
                     _tap_elem(country_elem)

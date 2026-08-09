@@ -17,9 +17,9 @@ DEFAULT_JFBYM_TOKEN = "E7LhAfiKssKDUGCudpvAhgSfOoSeYuSoc5_CsEM5ONI"
 DEFAULT_JFBYM_TYPE = "50009"
 
 COUNTRY_OPTIONS = {
-    "auto": "美国或加拿大（自动）",
-    "United States": "美国（United States）",
-    "Canada": "加拿大（Canada）",
+    "auto": "美国 / 加拿大（+1，同等优先）",
+    "United States": "美国 / 加拿大（+1，任一均可）",
+    "Canada": "加拿大 / 美国（+1，任一均可）",
 }
 
 _ACCOUNT_KEY_ALIASES = {
@@ -56,11 +56,8 @@ def normalize_country(value: str | None) -> str:
 
 
 def country_candidates(value: str | None) -> list[str]:
-    country = normalize_country(value)
-    if country == "Canada":
-        return ["Canada", "United States"]
-    if country == "United States":
-        return ["United States", "Canada"]
+    # 美国和加拿大共用 +1 区号，登录流程中二者是同等有效的候选项。
+    # 保留 value 参数是为了兼容旧设置和账号文件，但不再赋予任何一方优先级。
     return ["United States", "Canada"]
 
 
