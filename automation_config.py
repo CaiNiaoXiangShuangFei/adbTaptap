@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import json
 import re
-import urllib.parse
 from pathlib import Path
 
 
 DEFAULT_PHONE_NUMBER = "3412640535"
 DEFAULT_PHONE_COUNTRY = "auto"
-DEFAULT_SMS_API_URL = "http://a.62-us.com/api/get_sms?key=03b891d2d74603649eb43c0dff4fe43a"
-DEFAULT_SMS_TOKEN = "03b891d2d74603649eb43c0dff4fe43a"
+# 短信验证码链接由每条账号记录提供，不使用固定接口。
+DEFAULT_SMS_API_URL = ""
 DEFAULT_JFBYM_API_URL = "http://api.jfbym.com/api/YmServer/customApi"
 DEFAULT_JFBYM_TOKEN = "E7LhAfiKssKDUGCudpvAhgSfOoSeYuSoc5_CsEM5ONI"
 DEFAULT_JFBYM_TYPE = "50009"
@@ -36,10 +35,6 @@ _ACCOUNT_KEY_ALIASES = {
     "api": "sms_api_url",
     "短信接口": "sms_api_url",
     "短信api": "sms_api_url",
-    "sms_token": "sms_token",
-    "sms_key": "sms_token",
-    "key": "sms_token",
-    "短信token": "sms_token",
 }
 
 
@@ -59,31 +54,6 @@ def country_candidates(value: str | None) -> list[str]:
     # 美国和加拿大共用 +1 区号，登录流程中二者是同等有效的候选项。
     # 保留 value 参数是为了兼容旧设置和账号文件，但不再赋予任何一方优先级。
     return ["United States", "Canada"]
-
-
-def build_sms_api_url(api_url: str | None, token: str | None) -> str:
-    url = (api_url or DEFAULT_SMS_API_URL).strip()
-    key = (token or "").strip()
-    if not key:
-        return url
-    if "{token}" in url:
-        return url.replace("{token}", urllib.parse.quote(key, safe=""))
-
-    parsed = urllib.parse.urlsplit(url)
-    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    replaced = False
-    updated = []
-    for name, value in query:
-        if name.lower() in {"key", "token", "api_key", "apikey"}:
-            updated.append((name, key))
-            replaced = True
-        else:
-            updated.append((name, value))
-    if not replaced:
-        updated.append(("key", key))
-    return urllib.parse.urlunsplit(
-        (parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(updated), parsed.fragment)
-    )
 
 
 def extract_sms_verification_code(data: str) -> str:

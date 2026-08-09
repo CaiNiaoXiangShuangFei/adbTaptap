@@ -31,8 +31,6 @@ from automation_config import (
     DEFAULT_PHONE_COUNTRY,
     DEFAULT_PHONE_NUMBER,
     DEFAULT_SMS_API_URL,
-    DEFAULT_SMS_TOKEN,
-    build_sms_api_url,
     country_candidates,
     extract_sms_verification_code,
     load_account_file,
@@ -99,7 +97,6 @@ def _close_log():
 # ============ 配置 ============
 TAPTAP_PACKAGE = "com.taptap"
 SMS_API_URL = DEFAULT_SMS_API_URL
-SMS_TOKEN = DEFAULT_SMS_TOKEN
 PHONE_NUMBER = DEFAULT_PHONE_NUMBER
 PHONE_COUNTRY = DEFAULT_PHONE_COUNTRY
 GAME_NAME = "我的休闲时光"
@@ -118,8 +115,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="TapTap 自动登录 + 下载脚本")
     parser.add_argument("--device", "-d", help="设备 ID（IP:PORT 或序列号），不指定则列出可用设备")
     parser.add_argument("--adb", help="adb 可执行文件或 platform-tools 目录；默认自动查找")
-    parser.add_argument("--sms-api", help="短信验证码 API 地址", default=None)
-    parser.add_argument("--sms-token", help="短信验证码 API Token/Key", default=None)
+    parser.add_argument("--sms-api", "--sms-link", dest="sms_api", help="当前账号的完整验证码提取链接", default=None)
     parser.add_argument("--phone", help="手机号", default=None)
     parser.add_argument("--country", help="手机号国家：auto / United States / Canada", default=None)
     parser.add_argument("--account-file", help="账号文本文件路径", default=None)
@@ -206,7 +202,6 @@ if ARGS.account_file:
     PHONE_NUMBER = account_config.get("phone", PHONE_NUMBER)
     PHONE_COUNTRY = account_config.get("country", PHONE_COUNTRY)
     SMS_API_URL = account_config.get("sms_api_url", SMS_API_URL)
-    SMS_TOKEN = account_config.get("sms_token", SMS_TOKEN)
 
 if ARGS.phone:
     PHONE_NUMBER = ARGS.phone
@@ -214,9 +209,6 @@ if ARGS.country:
     PHONE_COUNTRY = normalize_country(ARGS.country)
 if ARGS.sms_api:
     SMS_API_URL = ARGS.sms_api
-if ARGS.sms_token is not None:
-    SMS_TOKEN = ARGS.sms_token
-SMS_API_URL = build_sms_api_url(SMS_API_URL, SMS_TOKEN)
 if ARGS.jfbym_api:
     JFBYM_API_URL = ARGS.jfbym_api
 if ARGS.jfbym_token is not None:
@@ -1322,8 +1314,11 @@ def verify_captcha_with_jfbym() -> bool:
 # ============ 获取验证码 ============
 
 def fetch_sms_code() -> str:
-    """从 API 获取短信验证码。"""
-    print(f"\n[获取验证码] 请求 SMS API...")
+    """原样访问当前账号提供的完整链接并提取短信验证码。"""
+    if not SMS_API_URL:
+        print("\n[获取验证码] [FAIL] 当前账号未配置验证码提取链接")
+        return ""
+    print(f"\n[获取验证码] 访问账号验证码提取链接...")
     try:
         resp = requests.get(
             SMS_API_URL,
@@ -1334,7 +1329,7 @@ def fetch_sms_code() -> str:
             },
         )
         data = resp.text.strip()
-        print(f"    API 返回: {data}")
+        print(f"    链接返回: {data}")
 
         code = extract_sms_verification_code(data)
         if code:
@@ -1343,7 +1338,7 @@ def fetch_sms_code() -> str:
 
         print(f"    [WARN] 未找到验证码，原始数据: {data}")
     except Exception as e:
-        print(f"    [FAIL] API 请求失败: {e}")
+        print(f"    [FAIL] 验证码链接访问失败: {e}")
     return ""
 
 

@@ -554,17 +554,6 @@
     </div>
     <div class="settings-grid">
       <div class="settings-field full">
-        <label for="settingSmsApi">短信 API 地址</label>
-        <input class="settings-input" id="settingSmsApi" autocomplete="off" spellcheck="false">
-      </div>
-      <div class="settings-field full">
-        <label for="settingSmsToken">短信 API Token / Key</label>
-        <div class="secret-row">
-          <input class="settings-input" id="settingSmsToken" type="password" autocomplete="off" spellcheck="false">
-          <button class="btn" type="button" data-toggle-secret="settingSmsToken">显示</button>
-        </div>
-      </div>
-      <div class="settings-field full">
         <label for="settingJfbymApi">云码识别 API 地址</label>
         <input class="settings-input" id="settingJfbymApi" autocomplete="off" spellcheck="false">
       </div>
@@ -580,7 +569,7 @@
         <input class="settings-input" id="settingJfbymType" autocomplete="off" spellcheck="false">
       </div>
     </div>
-    <div class="settings-hint">设置保存在当前电脑，下次打开页面仍然有效；修改后的内容从下一次任务启动开始使用。</div>
+    <div class="settings-hint">验证码提取链接来自账号文本（账号----完整链接），程序会原样访问；这里只设置云码识别参数。设置保存在当前电脑，修改后从下一次任务启动开始使用。</div>
     <div class="settings-actions">
       <button class="btn" id="btnCancelSettings" type="button">取消</button>
       <button class="btn primary" id="btnSaveSettings" type="button">保存设置</button>
@@ -1064,8 +1053,6 @@ function applySettingsPayload(payload) {
     ).join("");
   }
   document.getElementById("taskCountry").value = settings.country || "auto";
-  document.getElementById("settingSmsApi").value = settings.sms_api_url || "";
-  document.getElementById("settingSmsToken").value = settings.sms_token || "";
   document.getElementById("settingJfbymApi").value = settings.jfbym_api_url || "";
   document.getElementById("settingJfbymToken").value = settings.jfbym_token || "";
   document.getElementById("settingJfbymType").value = settings.jfbym_type || "";
@@ -1096,8 +1083,6 @@ async function saveSettings() {
   btn.disabled = true;
   const data = await apiPost("/api/settings", {
     country: document.getElementById("taskCountry").value,
-    sms_api_url: document.getElementById("settingSmsApi").value.trim(),
-    sms_token: document.getElementById("settingSmsToken").value.trim(),
     jfbym_api_url: document.getElementById("settingJfbymApi").value.trim(),
     jfbym_token: document.getElementById("settingJfbymToken").value.trim(),
     jfbym_type: document.getElementById("settingJfbymType").value.trim(),
@@ -1191,7 +1176,7 @@ function renderAccounts() {
       '<td><input type="checkbox" data-account-check="' + esc(account.id) + '"' +
         (account.selected ? " checked" : "") + (locked ? " disabled" : "") + ' aria-label="执行账号 ' + esc(account.phone) + '"></td>' +
       '<td><b>' + esc(account.phone) + '</b><div class="muted">' + esc(account.country || "auto") +
-        (account.has_sms_url ? ' · 验证码链接已绑定' : ' · 使用全局短信接口') + '</div></td>' +
+        (account.has_sms_url ? ' · 验证码链接已绑定' : ' · 缺少验证码链接') + '</div></td>' +
       '<td><select class="account-device-select" data-account-device="' + esc(account.id) + '"' + (locked ? " disabled" : "") + '>' +
         deviceAssignmentOptions(account) + '</select></td>' +
       '<td>' + accountStatusBadge(account) + '</td>' +

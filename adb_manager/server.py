@@ -41,8 +41,6 @@ from automation_config import (
     DEFAULT_JFBYM_TOKEN,
     DEFAULT_JFBYM_TYPE,
     DEFAULT_PHONE_COUNTRY,
-    DEFAULT_SMS_API_URL,
-    DEFAULT_SMS_TOKEN,
     normalize_country,
     parse_accounts_text,
 )
@@ -60,8 +58,6 @@ DEVICE_LOGS_DIR = os.path.join(BASE_DIR, "device_logs")
 UI_DUMPS_DIR = os.path.join(BASE_DIR, "ui_dumps")
 DEFAULT_SETTINGS = {
     "country": DEFAULT_PHONE_COUNTRY,
-    "sms_api_url": DEFAULT_SMS_API_URL,
-    "sms_token": DEFAULT_SMS_TOKEN,
     "jfbym_api_url": DEFAULT_JFBYM_API_URL,
     "jfbym_token": DEFAULT_JFBYM_TOKEN,
     "jfbym_type": DEFAULT_JFBYM_TYPE,
@@ -199,16 +195,12 @@ def api_settings_save(data: dict) -> dict:
         settings = _read_settings_unlocked()
         if "country" in data:
             settings["country"] = normalize_country(data.get("country"))
-        for key in (
-            "sms_api_url", "sms_token", "jfbym_api_url", "jfbym_token", "jfbym_type",
-        ):
+        for key in ("jfbym_api_url", "jfbym_token", "jfbym_type"):
             if key in data:
                 value = str(data.get(key) or "").strip()
                 if len(value) > 4096:
                     return {"ok": False, "message": f"{key} 内容过长"}
                 settings[key] = value
-        if not settings["sms_api_url"]:
-            return {"ok": False, "message": "短信 API 地址不能为空"}
         if not settings["jfbym_api_url"]:
             return {"ok": False, "message": "云码 API 地址不能为空"}
         _write_settings_unlocked(settings)
@@ -259,7 +251,6 @@ def _read_account_state_unlocked() -> dict:
             "phone": phone,
             "country": normalize_country(raw.get("country")),
             "sms_api_url": str(raw.get("sms_api_url") or ""),
-            "sms_token": str(raw.get("sms_token") or ""),
             "selected": bool(raw.get("selected", status != "completed")) and status != "completed",
             "assigned_device": str(raw.get("assigned_device") or ""),
             "status": status,
@@ -339,6 +330,14 @@ def api_accounts_import(filename: str, content: str) -> dict:
         parsed_accounts = parse_accounts_text(content)
     except ValueError as exc:
         return {"ok": False, "message": str(exc)}
+    missing_links = [account["phone"] for account in parsed_accounts if not account.get("sms_api_url")]
+    if missing_links:
+        preview = "、".join(missing_links[:5])
+        suffix = " 等" if len(missing_links) > 5 else ""
+        return {
+            "ok": False,
+            "message": f"账号 {preview}{suffix} 缺少验证码提取链接，请使用 账号----完整链接 格式",
+        }
 
     with _account_lock:
         old_state = _read_account_state_unlocked()
@@ -355,7 +354,6 @@ def api_accounts_import(filename: str, content: str) -> dict:
                 "phone": phone,
                 "country": normalize_country(account.get("country")),
                 "sms_api_url": str(account.get("sms_api_url") or ""),
-                "sms_token": str(account.get("sms_token") or ""),
                 "selected": bool(previous.get("selected", True)) and not completed,
                 "assigned_device": str(previous.get("assigned_device") or ""),
                 "status": "completed" if completed else previous_status if previous_status == "failed" else "pending",
@@ -710,12 +708,14 @@ def build_task_command(serial: str, settings: dict, account_path: str | None) ->
         "--device", serial,
         "--adb", ADB_PATH,
         "--country", settings["country"],
-        "--sms-api", settings["sms_api_url"],
-        "--sms-token", settings["sms_token"],
         "--jfbym-api", settings["jfbym_api_url"],
         "--jfbym-token", settings["jfbym_token"],
         "--jfbym-type", settings["jfbym_type"],
     ]
+    sms_url = str(settings.get("sms_api_url") or "").strip()
+    if sms_url:
+        # 每个账号的完整链接原样传递，不拼接固定 API、Token 或查询参数。
+        command.extend(["--sms-api", sms_url])
     if account_path:
         command.extend(["--account-file", account_path])
     return command
@@ -765,8 +765,6 @@ def _prepare_account_file(record: dict) -> str:
     }
     if record.get("sms_api_url"):
         payload["sms_api_url"] = record["sms_api_url"]
-    if record.get("sms_token"):
-        payload["sms_token"] = record["sms_token"]
     temp_path = path + ".tmp"
     with open(temp_path, "w", encoding="utf-8") as file:
         json.dump(payload, file, ensure_ascii=False, indent=2)
@@ -831,10 +829,6 @@ def _run_device_queue(task: dict, account_ids: list[str], settings: dict) -> Non
         account_settings["country"] = record.get("country") or settings["country"]
         if record.get("sms_api_url"):
             account_settings["sms_api_url"] = record["sms_api_url"]
-            # 账号文件中的提取链接必须原样 GET，不追加全局 Token/Key。
-            account_settings["sms_token"] = ""
-        elif record.get("sms_token"):
-            account_settings["sms_token"] = record["sms_token"]
         try:
             account_path = _prepare_account_file(record)
             command = build_task_command(serial, account_settings, account_path)
@@ -944,6 +938,14 @@ def api_task_run(serials) -> dict:
         ]
         if not candidates:
             return {"ok": False, "message": "没有已勾选且未完成的账号"}
+        missing_links = [record["phone"] for record in candidates if not record.get("sms_api_url")]
+        if missing_links:
+            preview = "、".join(missing_links[:5])
+            suffix = " 等" if len(missing_links) > 5 else ""
+            return {
+                "ok": False,
+                "message": f"账号 {preview}{suffix} 缺少验证码提取链接，请重新选择账号文本文件",
+            }
 
         queues = {serial: [] for serial in requested}
         skipped_assigned = []
