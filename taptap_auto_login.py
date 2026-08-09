@@ -930,6 +930,36 @@ def is_login_page(elements) -> bool:
     return has_phone and has_login
 
 
+def find_change_phone_element(elements):
+    """查找 SIM 卡/历史登录账号页面中手机号右侧的编辑按钮。"""
+    return _find_element_by_id_candidates(elements, [
+        "btn_change_phone",
+        "change_phone",
+        "edit_phone",
+    ])
+
+
+def is_saved_phone_login_page(elements) -> bool:
+    """识别展示脱敏手机号和“一键登录”的历史账号页面。"""
+    change_phone = find_change_phone_element(elements)
+    if change_phone is None:
+        return False
+    has_masked_phone = any(
+        re.fullmatch(r"\s*\d{2,4}\*{3,}\d{2,4}\s*", elem.text or "")
+        for elem in elements
+    )
+    has_quick_login = _find_element_by_id_candidates(
+        elements,
+        ["authsdk_login_view"],
+    ) is not None
+    return has_masked_phone or has_quick_login
+
+
+def is_phone_login_entry_page(elements) -> bool:
+    """头像入口可能进入普通手机号页，也可能进入已保存手机号页。"""
+    return is_login_page(elements) or is_saved_phone_login_page(elements)
+
+
 def is_country_list_page(elements) -> bool:
     area_rows = [
         elem for elem in elements
@@ -1605,6 +1635,7 @@ def main():
 
     # 循环：弹窗检测 + 头像查找合并在一起，失败自动重试
     avatar_found = False
+    login_entry_elements = None
     for attempt in range(6):
         try:
             elems = get_ui_elements_safe(DEVICE_ID)
@@ -1665,9 +1696,16 @@ def main():
         if avatar_elem:
             print(f"    找到头像: {_elem_desc(avatar_elem)}")
             _tap_elem(avatar_elem)
-            if wait_for_ui_condition(is_login_page, timeout=3) is not None:
+            login_entry_elements = wait_for_ui_condition(
+                is_phone_login_entry_page,
+                timeout=3,
+            )
+            if login_entry_elements is not None:
                 avatar_found = True
-                print("    [OK] 头像点击已生效，登录页已出现")
+                if is_saved_phone_login_page(login_entry_elements):
+                    print("    [OK] 头像点击已生效，已进入保存手机号的一键登录页")
+                else:
+                    print("    [OK] 头像点击已生效，手机号输入页已出现")
                 break
             print("    [WARN] 点击头像后未进入登录页，继续重试...")
 
@@ -1684,6 +1722,38 @@ def main():
     if not avatar_found:
         _log("    [FAIL] 第 5 步未通过验证：未进入登录页")
         return
+
+    # 部分设备插有 SIM 卡或曾登录过，会先显示脱敏手机号的一键登录页。
+    # 点击手机号右侧编辑按钮后，其余流程与普通手机号登录完全一致。
+    if login_entry_elements and is_saved_phone_login_page(login_entry_elements):
+        saved_phone_elements = (
+            log_global_ui_elements("5 已保存手机号页面，点击编辑前")
+            or login_entry_elements
+        )
+        phone_entry_ready = False
+        for attempt in range(1, 3):
+            change_phone = find_change_phone_element(saved_phone_elements)
+            if change_phone is None:
+                print("    [FAIL] 已识别保存手机号页面，但未找到手机号编辑按钮")
+                break
+            print(f"    找到手机号编辑按钮: {_elem_desc(change_phone)}")
+            _tap_elem(change_phone, "切换手机号")
+            phone_elements = wait_for_ui_condition(
+                is_login_page,
+                timeout=CLICK_VERIFY_TIMEOUT,
+            )
+            if phone_elements is not None:
+                login_entry_elements = phone_elements
+                phone_entry_ready = True
+                print("    [OK] 编辑按钮点击已生效，手机号输入页已出现")
+                break
+            if attempt < 2:
+                print("    [WARN] 点击编辑按钮后未进入手机号输入页，正在重试...")
+                saved_phone_elements = get_ui_elements_safe(DEVICE_ID)
+
+        if not phone_entry_ready:
+            _log("    [FAIL] 第 5 步未通过验证：无法从保存手机号页面进入手机号输入页")
+            return
 
     # ---- 第 6 步：切换国家/地区 ----
     preferred_countries = country_candidates(PHONE_COUNTRY)
