@@ -856,7 +856,7 @@ def input_text_verified(
     value: str,
     *,
     clear: bool = True,
-    accept_hidden: bool = False,
+    verify_transition: bool = False,
 ) -> bool:
     """输入普通文本并从 UI 读回验证，不成功则返回 False。"""
     _tap_elem(input_elem)
@@ -882,11 +882,16 @@ def input_text_verified(
                 pass
 
     after_primary_input = get_ui_elements_safe(DEVICE_ID)
+    if verify_transition and primary_command_succeeded:
+        if is_username_or_home_page(after_primary_input):
+            return True
+        transitioned = wait_for_ui_condition(
+            is_username_or_home_page,
+            timeout=8,
+        )
+        # 验证码正确会自动跳转；仍在原页面表示验证码错误或输入未生效，不再重复输入。
+        return transitioned is not None
     if _input_text_is_present(after_primary_input, value):
-        return True
-    if accept_hidden and primary_command_succeeded and verification_code_input_hides_value(
-        after_primary_input, input_elem, value
-    ):
         return True
 
     # 纯 ASCII 文本可使用系统 input text 作为回退。
@@ -901,46 +906,16 @@ def input_text_verified(
         time.sleep(0.5)
         after_fallback_input = get_ui_elements_safe(DEVICE_ID)
         if result.returncode == 0:
+            if verify_transition:
+                if is_username_or_home_page(after_fallback_input):
+                    return True
+                transitioned = wait_for_ui_condition(
+                    is_username_or_home_page,
+                    timeout=8,
+                )
+                return transitioned is not None
             if _input_text_is_present(after_fallback_input, value):
                 return True
-            if accept_hidden and verification_code_input_hides_value(
-                after_fallback_input, input_elem, value
-            ):
-                return True
-    return False
-
-
-def verification_code_input_hides_value(elements, input_elem, code: str) -> bool:
-    """识别不会在 UI XML 中回传验证码明文的安全输入控件。"""
-    if not code.isdigit() or len(code) != 6:
-        return False
-    target_id = (input_elem.resource_id or "").lower()
-    markers = ("item_edittext", "verify", "verification", "sms", "code", "captcha")
-    candidates = [
-        elem for elem in elements
-        if "EditText" in (elem.class_name or "")
-        and (
-            (target_id and (elem.resource_id or "").lower() == target_id)
-            or elem.rect == input_elem.rect
-        )
-    ]
-    if not candidates:
-        # 输入满 6 位后部分页面会自动提交并移除输入框，由步骤 12 继续验证页面状态。
-        return is_username_or_home_page(elements)
-    for elem in candidates:
-        resource_id = (elem.resource_id or "").lower()
-        description = str(getattr(elem, "content_description", "") or "")
-        visible_value = (elem.text or "") + description
-        digits = re.sub(r"\D", "", visible_value)
-        if digits.endswith(code):
-            return True
-        masked_count = sum(visible_value.count(char) for char in ("•", "●", "*"))
-        if masked_count >= len(code):
-            return True
-        if any(marker in resource_id for marker in markers) and not visible_value.strip():
-            return True
-        if bool(getattr(elem, "password", False)):
-            return True
     return False
 
 
@@ -2018,13 +1993,10 @@ def main():
     if not code_inputs:
         print("    [FAIL] 第 11 步失败：未找到验证码输入框")
         return
-    if not input_text_verified(code_inputs[0], code, accept_hidden=True):
-        print("    [FAIL] 第 11 步失败：验证码输入后控件状态未发生有效变化")
+    if not input_text_verified(code_inputs[0], code, verify_transition=True):
+        print("    [FAIL] 第 11 步失败：输入后仍停留在验证码页面，验证码可能错误或未生效")
         return
-    print(
-        "    [OK] 验证码输入已通过明文、隐藏输入状态或页面跳转验证；"
-        "第 12 步将继续确认提交结果"
-    )
+    print("    [OK] 验证码输入后已自动跳转，验证码确认成功")
 
     time.sleep(CLICK_SETTLE_DELAY)
 
