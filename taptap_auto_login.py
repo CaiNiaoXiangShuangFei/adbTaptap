@@ -5,13 +5,11 @@ TapTap 自动登录脚本
 """
 
 import argparse
-import argparse
 import base64
 import io
 import os
 import random
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -24,8 +22,8 @@ from io import BytesIO
 import requests
 from PIL import Image
 
+from adb_locator import find_adb
 from phone_agent.adb import *
-from phone_agent.adb.device import _get_adb_prefix
 
 # ============ 日志系统 ============
 _LOG_FILE = None
@@ -84,6 +82,7 @@ JFBYM_TYPE = "50009"
 def parse_args():
     parser = argparse.ArgumentParser(description="TapTap 自动登录 + 下载脚本")
     parser.add_argument("--device", "-d", help="设备 ID（IP:PORT 或序列号），不指定则列出可用设备")
+    parser.add_argument("--adb", help="adb 可执行文件或 platform-tools 目录；默认自动查找")
     parser.add_argument("--sms-api", help="短信验证码 API 地址", default=None)
     parser.add_argument("--phone", help="手机号", default=None)
     parser.add_argument("--game", help="要搜索下载的游戏名", default=None)
@@ -122,6 +121,37 @@ def resolve_device_id(args_device: str | None) -> str:
 
 
 ARGS = parse_args()
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_ADB_PATH = find_adb(ARGS.adb, base_dirs=[_SCRIPT_DIR])
+if not _ADB_PATH:
+    print(
+        "[FAIL] 找不到 adb。请将 platform-tools 放入项目目录、加入 PATH，"
+        "或通过 --adb/ADB_PATH 指定。"
+    )
+    sys.exit(1)
+
+# 替换 phone_agent 里的 _get_adb_prefix，确保所有调用使用同一个动态路径。
+import phone_agent.adb.device as _dev_mod
+import phone_agent.adb.input as _inp_mod
+import phone_agent.adb.screenshot as _scr_mod
+import phone_agent.adb.uiautomator as _ui_mod
+
+_orig_prefix = _dev_mod._get_adb_prefix
+
+
+def _adb_prefix(device_id=None):
+    prefix = _orig_prefix(device_id)
+    prefix[0] = _ADB_PATH
+    return prefix
+
+
+_dev_mod._get_adb_prefix = _adb_prefix
+_inp_mod._get_adb_prefix = _adb_prefix
+_scr_mod._get_adb_prefix = _adb_prefix
+_ui_mod._get_adb_prefix = _adb_prefix
+
+print(f"    [OK] 使用 adb: {_ADB_PATH}")
 DEVICE_ID = resolve_device_id(ARGS.device)
 
 # 用 CLI 参数覆盖配置
@@ -135,45 +165,20 @@ if ARGS.game:
 
 # ============ 辅助函数 ============
 
-def adb_cmd(*args) -> subprocess.CompletedProcess:
-    prefix = _adb_prefix(DEVICE_ID) if _ADB_PATH else _get_adb_prefix(DEVICE_ID)
-    return subprocess.run(prefix + list(args), capture_output=True, text=True, errors='replace')
-
-
-# 在 sandbox 环境下 adb 可能不在 PATH 中，探测 adb 路径
-_ADB_PATH = shutil.which("adb")
-if not _ADB_PATH:
-    for _p in [os.path.join(os.path.expanduser("~"), "platform-tools", "adb.exe"),
-               os.path.join(os.path.expanduser("~"), "adb", "adb.exe"),
-               r"D:\platform-tools\adb.exe",
-               r"C:\Users\admin.LAPTOP\adb.exe",
-               r"D:\android\platform-tools\adb.exe",
-               r"C:\adb\adb.exe"]:
-        if os.path.isfile(_p):
-            _ADB_PATH = _p
-            break
-
-if not _ADB_PATH:
-    print("[FAIL] 找不到 adb.exe，请设置环境变量或指定路径")
-    sys.exit(1)
-
-print(f"    [OK] 使用 adb: {_ADB_PATH}")
-
-if _ADB_PATH:
-    # 替换 phone_agent 里的 _get_adb_prefix 返回完整路径
-    import phone_agent.adb.device as _dev_mod
-    import phone_agent.adb.input as _inp_mod
-    import phone_agent.adb.screenshot as _scr_mod
-    import phone_agent.adb.uiautomator as _ui_mod
-    _orig_prefix = _dev_mod._get_adb_prefix
-    def _adb_prefix(device_id=None):
-        p = _orig_prefix(device_id)
-        p[0] = _ADB_PATH
-        return p
-    _dev_mod._get_adb_prefix = _adb_prefix
-    _inp_mod._get_adb_prefix = _adb_prefix
-    _scr_mod._get_adb_prefix = _adb_prefix
-    _ui_mod._get_adb_prefix = _adb_prefix
+def adb_cmd(*args, device_id: str | None = None, timeout: float = 15) -> subprocess.CompletedProcess:
+    """使用已探测到的 adb 执行设备命令。"""
+    target = DEVICE_ID if device_id is None else device_id
+    command = [_ADB_PATH]
+    if target:
+        command.extend(["-s", target])
+    command.extend(map(str, args))
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        errors="replace",
+    )
 
 
 def _extract_ip(device_id: str) -> str:
@@ -188,6 +193,15 @@ _CONFIGURED_PORT = DEVICE_ID.split(":")[1] if ":" in DEVICE_ID else "5555"
 def ensure_device_connected() -> bool:
     """检查设备是否在线，不在线则尝试重连（自动尝试多个端口）。"""
     global DEVICE_ID
+
+    # USB 设备没有可供 adb connect 使用的网络端口，只检查当前状态。
+    if ":" not in DEVICE_ID:
+        try:
+            check = adb_cmd("get-state", timeout=3)
+            return check.returncode == 0 and check.stdout.strip() == "device"
+        except (OSError, subprocess.SubprocessError):
+            return False
+
     ip = _extract_ip(DEVICE_ID)
     # 按优先级尝试多个端口：当前端口 -> 5555（tcpip模式）
     ports_to_try = [_CONFIGURED_PORT, "5555"]
@@ -202,16 +216,23 @@ def ensure_device_connected() -> bool:
     for port in ports:
         target = f"{ip}:{port}"
         for attempt in range(3):
-            subprocess.run(
-                ["d:\\platform-tools\\adb.exe", "connect", target],
-                capture_output=True, text=True, timeout=5, errors='replace'
-            )
+            try:
+                subprocess.run(
+                    [_ADB_PATH, "connect", target],
+                    capture_output=True, text=True, timeout=5, errors="replace"
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                print(f"    [WARN] adb 重连命令执行失败: {exc}")
+                return False
             time.sleep(0.5)
-            check = subprocess.run(
-                ["d:\\platform-tools\\adb.exe", "-s", target, "get-state"],
-                capture_output=True, text=True, timeout=3, errors='replace'
-            )
-            if check.returncode == 0 and "device" in check.stdout.strip():
+            try:
+                check = subprocess.run(
+                    [_ADB_PATH, "-s", target, "get-state"],
+                    capture_output=True, text=True, timeout=3, errors="replace"
+                )
+            except (OSError, subprocess.SubprocessError):
+                check = None
+            if check and check.returncode == 0 and check.stdout.strip() == "device":
                 # 重连成功后更新 DEVICE_ID
                 if DEVICE_ID != target:
                     DEVICE_ID = target
@@ -226,13 +247,16 @@ def ensure_device_connected() -> bool:
 
 def get_ui_elements_safe(device_id) -> list:
     """带重连的 get_ui_elements。"""
+    current_device = device_id
     for _ in range(3):
         try:
-            return get_ui_elements(device_id)
+            return get_ui_elements(current_device)
         except RuntimeError as e:
             if "not found" in str(e).lower():
                 print("    [WARN] 设备断连，尝试重连...")
                 if ensure_device_connected():
+                    # 重连可能切换到了 5555 端口，后续调用必须使用新 serial。
+                    current_device = DEVICE_ID
                     time.sleep(1)
                     continue
             raise
@@ -242,11 +266,35 @@ def get_ui_elements_safe(device_id) -> list:
 def clear_app_data(package: str) -> bool:
     """清除应用数据。"""
     print(f"[1] 清除 {package} 数据...")
-    result = adb_cmd("shell", "pm", "clear", package)
-    if result.returncode == 0:
-        print("    [OK] 数据已清除")
-        return True
-    print(f"    [FAIL] 清除失败: {result.stderr}")
+    commands = [
+        ("shell", "pm", "clear", "--user", "0", package),
+        ("shell", "pm", "clear", package),
+    ]
+    last_message = "未知错误"
+    for attempt, command in enumerate(commands, start=1):
+        try:
+            # 先停止应用，避免清数据时与前台进程或弹窗监控争用。
+            adb_cmd("shell", "am", "force-stop", package, timeout=8)
+            result = adb_cmd(*command, timeout=15)
+        except (OSError, subprocess.SubprocessError) as exc:
+            last_message = str(exc)
+            result = None
+
+        if result is not None:
+            output = "\n".join(
+                part.strip() for part in (result.stdout, result.stderr) if part.strip()
+            )
+            output_lines = {line.strip().lower() for line in output.splitlines()}
+            if result.returncode == 0 and "success" in output_lines:
+                print("    [OK] 数据已清除")
+                return True
+            last_message = output or f"adb 退出码 {result.returncode}"
+
+        if attempt < len(commands):
+            print(f"    [WARN] 清除失败，检查连接后重试: {last_message}")
+            ensure_device_connected()
+
+    print(f"    [FAIL] 清除失败: {last_message}")
     return False
 
 
@@ -654,8 +702,11 @@ class PopupMonitor:
             self._stop_event.wait(self.interval)
 
     def _check_popups(self):
+        # 重连可能更新全局 DEVICE_ID（例如无线调试端口变化）。
+        device_id = DEVICE_ID
+        self.device_id = device_id
         try:
-            elements = get_ui_elements_safe(self.device_id)
+            elements = get_ui_elements_safe(device_id)
         except RuntimeError:
             return
         if not elements:
@@ -666,13 +717,13 @@ class PopupMonitor:
         # 后台线程不处理，由主线程步骤[18]统一处理
         install_popup_active = find_with_multiple_conditions(
             res_id="android:id/button3", text="继续",
-            clickable=True, elements=elements, device_id=self.device_id
+            clickable=True, elements=elements, device_id=device_id
         ) is not None
 
         # 1) btn_dismiss 通用关闭按钮
         dismiss = find_with_multiple_conditions(
             res_id="com.taptap:id/btn_dismiss", clickable=True,
-            elements=elements, device_id=self.device_id
+            elements=elements, device_id=device_id
         )
         if dismiss:
             print(f"    [弹窗监控] → 关闭 btn_dismiss: {_elem_desc(dismiss)}")
@@ -682,7 +733,7 @@ class PopupMonitor:
         # 2) 系统权限弹窗（"允许" Button）
         sys_perm = find_with_multiple_conditions(
             text="允许", class_name="Button", clickable=True,
-            exact_match=True, elements=elements, device_id=self.device_id
+            exact_match=True, elements=elements, device_id=device_id
         )
         if sys_perm:
             print("    [弹窗监控] → 系统权限「允许」")
@@ -695,7 +746,7 @@ class PopupMonitor:
             for btn_text in ["取消", "以后再说", "稍后", "忽略", "暂不更新"]:
                 btn = find_with_multiple_conditions(
                     text=btn_text, clickable=True, exact_match=True,
-                    elements=elements, device_id=self.device_id
+                    elements=elements, device_id=device_id
                 )
                 if btn:
                     cy = (btn.rect[1] + btn.rect[3]) // 2
@@ -716,15 +767,15 @@ def main():
     _log(f"日志文件: {log_path}")
     _log("=" * 60)
 
-    # ---- 启动后台弹窗监控 ----
-    monitor = PopupMonitor(DEVICE_ID, interval=2.0)
-    monitor.start()
-
     # ---- 第 1 步：清除数据 ----
     clear_app_data(TAPTAP_PACKAGE)
 
     # ---- 第 2 步：启动 TapTap ----
     launch_app_safe("TapTap")
+
+    # 应用启动后再监控弹窗，避免 UI dump 与清数据命令并发执行。
+    monitor = PopupMonitor(DEVICE_ID, interval=2.0)
+    monitor.start()
 
 
     # ---- 第 3 步：隐私政策和权限弹窗 ----

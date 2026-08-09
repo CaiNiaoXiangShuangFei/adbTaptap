@@ -124,7 +124,8 @@
   .pv-stage { display: flex; justify-content: center; }
   .pv-stage img {
     max-width: 92vw; max-height: 68vh; border-radius: 8px; background: #000;
-    box-shadow: 0 8px 40px rgba(0,0,0,.6); cursor: crosshair; user-select: none; -webkit-user-drag: none;
+    box-shadow: 0 8px 40px rgba(0,0,0,.6); cursor: crosshair; user-select: none;
+    -webkit-user-drag: none; touch-action: none;
   }
   .pv-hint { margin-top: 8px; font-size: 12px; }
   .pv-bar { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; justify-content: center; }
@@ -452,13 +453,66 @@ function connectAddress(addr) {
 }
 
 // ---------- 截图 ----------
-function showScreenshot(serial) {
-  const img = document.getElementById("modalImg");
-  img.src = "/api/devices/" + encodeURIComponent(serial) + "/screenshot?t=" + Date.now();
-  document.getElementById("modalTitle").textContent = serial;
-  document.getElementById("modal").classList.add("show");
+let screenshotGeneration = 0;
+
+function replaceImageBlob(img, blob) {
+  const oldUrl = img.dataset.objectUrl;
+  const newUrl = URL.createObjectURL(blob);
+  img.src = newUrl;
+  img.dataset.objectUrl = newUrl;
+  if (oldUrl) URL.revokeObjectURL(oldUrl);
 }
-function closeModal() { document.getElementById("modal").classList.remove("show"); }
+
+function clearImageBlob(img) {
+  const oldUrl = img.dataset.objectUrl;
+  if (oldUrl) URL.revokeObjectURL(oldUrl);
+  delete img.dataset.objectUrl;
+  img.removeAttribute("src");
+}
+
+async function fetchScreenshot(serial, signal) {
+  const res = await fetch(
+    "/api/devices/" + encodeURIComponent(serial) + "/screenshot?t=" + Date.now(),
+    { cache: "no-store", signal }
+  );
+  if (!res.ok) {
+    let message = "截图失败，设备可能离线";
+    try {
+      const data = await res.json();
+      if (data.error) message = data.error;
+    } catch (_) {}
+    throw new Error(message);
+  }
+  const blob = await res.blob();
+  if (!blob.type.startsWith("image/png") || blob.size < 8) {
+    throw new Error("截图数据不是有效的 PNG 图片");
+  }
+  return blob;
+}
+
+async function showScreenshot(serial) {
+  const generation = ++screenshotGeneration;
+  const img = document.getElementById("modalImg");
+  const title = document.getElementById("modalTitle");
+  clearImageBlob(img);
+  title.textContent = serial + " · 正在截图…";
+  document.getElementById("modal").classList.add("show");
+  try {
+    const blob = await fetchScreenshot(serial);
+    if (generation !== screenshotGeneration) return;
+    replaceImageBlob(img, blob);
+    title.textContent = serial;
+  } catch (e) {
+    if (generation !== screenshotGeneration) return;
+    title.textContent = serial + " · " + e.message;
+    toast(e.message, "err");
+  }
+}
+function closeModal() {
+  screenshotGeneration++;
+  document.getElementById("modal").classList.remove("show");
+  clearImageBlob(document.getElementById("modalImg"));
+}
 document.getElementById("modal").addEventListener("click", e => {
   if (e.target.id === "modal") closeModal();
 });
@@ -469,10 +523,16 @@ let streamOn = false;
 let streamTimer = null;
 let streamInterval = 1000;
 let dragStart = null;
+let streamController = null;
+let streamGeneration = 0;
+let streamFailures = 0;
 
 function openPreview(serial) {
+  closePreview(false);
   streamSerial = serial;
   streamOn = true;
+  streamGeneration++;
+  streamFailures = 0;
   streamInterval = parseInt(document.getElementById("pvInterval").value, 10) || 1000;
   document.getElementById("pvTitle").textContent = serial;
   document.getElementById("pvStatus").textContent = "正在连接…";
@@ -480,30 +540,42 @@ function openPreview(serial) {
   streamTick();
 }
 
-function closePreview() {
+function closePreview(hide = true) {
   streamOn = false;
   clearTimeout(streamTimer);
+  if (streamController) streamController.abort();
+  streamController = null;
+  streamGeneration++;
   streamSerial = null;
-  document.getElementById("pvModal").classList.remove("show");
+  dragStart = null;
+  clearImageBlob(document.getElementById("pvImg"));
+  if (hide) document.getElementById("pvModal").classList.remove("show");
 }
 
 async function streamTick() {
   if (!streamOn) return;
+  const generation = streamGeneration;
+  const serial = streamSerial;
   const img = document.getElementById("pvImg");
+  streamController = new AbortController();
   try {
-    const res = await fetch("/api/devices/" + encodeURIComponent(streamSerial) + "/screenshot?t=" + Date.now());
-    if (!res.ok) throw new Error("截图失败，设备可能离线");
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const prev = img.src;
-    img.onload = () => { if (prev.startsWith("blob:")) URL.revokeObjectURL(prev); };
-    img.src = url;
+    const blob = await fetchScreenshot(serial, streamController.signal);
+    if (!streamOn || generation !== streamGeneration) return;
+    replaceImageBlob(img, blob);
+    streamFailures = 0;
     document.getElementById("pvStatus").textContent = "实时预览中";
   } catch (e) {
-    document.getElementById("pvStatus").textContent = "预览已停止：" + e.message;
-    closePreview();
+    if (e.name === "AbortError" || !streamOn || generation !== streamGeneration) return;
+    streamFailures++;
+    document.getElementById("pvStatus").textContent =
+      "截图失败，正在重试（" + streamFailures + "）：" + e.message;
+  } finally {
+    if (generation === streamGeneration) streamController = null;
   }
-  if (streamOn) streamTimer = setTimeout(streamTick, streamInterval);
+  if (streamOn && generation === streamGeneration) {
+    const retryDelay = streamFailures ? Math.max(2000, streamInterval) : streamInterval;
+    streamTimer = setTimeout(streamTick, retryDelay);
+  }
 }
 
 async function apiPost(url, body) {
@@ -525,10 +597,12 @@ function previewSend(url, body) {
 }
 
 const pvImg = document.getElementById("pvImg");
-pvImg.addEventListener("mousedown", e => {
+pvImg.addEventListener("pointerdown", e => {
+  if (!pvImg.naturalWidth) return;
+  pvImg.setPointerCapture(e.pointerId);
   dragStart = { x: e.clientX, y: e.clientY };
 });
-pvImg.addEventListener("mouseup", e => {
+pvImg.addEventListener("pointerup", e => {
   if (!dragStart || !streamSerial) return;
   const rect = pvImg.getBoundingClientRect();
   const sx = pvImg.naturalWidth / rect.width;
@@ -551,6 +625,7 @@ pvImg.addEventListener("mouseup", e => {
   }
   dragStart = null;
 });
+pvImg.addEventListener("pointercancel", () => { dragStart = null; });
 
 function sendKey(key) {
   if (streamSerial) previewSend("/api/devices/" + encodeURIComponent(streamSerial) + "/key", { key });
@@ -711,7 +786,7 @@ grid.addEventListener("click", e => {
 });
 
 setInterval(() => {
-  if (document.getElementById("autoRefresh").checked) loadDevices();
+  if (document.getElementById("autoRefresh").checked && !streamOn) loadDevices();
 }, 4000);
 
 loadDevices();

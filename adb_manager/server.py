@@ -1,4 +1,4 @@
-"""
+r"""
 ADB 设备管理 Web 服务
 - 可视化查看/管理多台 adb 手机
 - 一键连接新设备（IP:端口）、断开连接、USB 设备一键开启无线调试
@@ -16,7 +16,6 @@ import argparse
 import json
 import os
 import re
-import shutil
 import socket
 import subprocess
 import sys
@@ -30,6 +29,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 PROJECT_DIR = os.path.dirname(BASE_DIR)  # 项目根目录（taptap_auto_login.py 所在目录）
 TAPTAP_SCRIPT = os.path.join(PROJECT_DIR, "taptap_auto_login.py")
+if PROJECT_DIR not in sys.path:
+    sys.path.insert(0, PROJECT_DIR)
+
+from adb_locator import find_adb
 
 # 运行自动化脚本用的 Python：优先使用项目 venv
 _VENV_PY = os.path.join(PROJECT_DIR, ".venv", "Scripts", "python.exe")
@@ -41,25 +44,8 @@ ADB_PATH = None
 BATTERY_STATUS = {1: "未知", 2: "充电中", 3: "放电中", 4: "未充电", 5: "已充满"}
 
 _state_lock = threading.Lock()
-
-
-def find_adb() -> str | None:
-    """探测 adb 可执行文件路径（PATH 优先，其次常见安装位置）。"""
-    p = shutil.which("adb")
-    if p:
-        return p
-    for cand in [
-        os.path.join(os.path.expanduser("~"), "platform-tools", "adb.exe"),
-        os.path.join(os.path.expanduser("~"), "adb", "adb.exe"),
-        r"D:\platform-tools\adb.exe",
-        r"C:\Users\admin.LAPTOP\adb.exe",
-        r"D:\android\platform-tools\adb.exe",
-        r"C:\adb\adb.exe",
-        r"E:\edgeDownload\platform-tools\adb.exe",
-    ]:
-        if os.path.isfile(cand):
-            return cand
-    return None
+_screenshot_lock = threading.Lock()
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def adb(*args, timeout=10):
@@ -85,6 +71,41 @@ def shell(serial: str, cmd: str, timeout=8) -> str:
     """在指定设备上执行 shell 命令。"""
     args = ["-s", serial, "shell", cmd] if serial else ["shell", cmd]
     return adb_text(*args, timeout=timeout)
+
+
+def capture_screenshot(serial: str) -> tuple[bytes | None, str | None]:
+    """获取原始 PNG；无线设备瞬时断连时自动重连一次。"""
+    if not serial:
+        return None, "缺少设备序列号"
+
+    last_error = "截图失败"
+    with _screenshot_lock:
+        for attempt in range(2):
+            try:
+                r = subprocess.run(
+                    [ADB_PATH, "-s", serial, "exec-out", "screencap", "-p"],
+                    capture_output=True,
+                    timeout=15,
+                )
+            except subprocess.TimeoutExpired:
+                last_error = "截图超时"
+                r = None
+            except OSError as exc:
+                return None, f"adb 执行失败: {exc}"
+
+            if r is not None:
+                data = r.stdout or b""
+                if r.returncode == 0 and data.startswith(_PNG_SIGNATURE):
+                    # exec-out 返回的是原始二进制，不能替换 CRLF，否则会破坏 PNG。
+                    return data, None
+                stderr = (r.stderr or b"").decode("utf-8", errors="replace").strip()
+                last_error = stderr or f"adb 退出码 {r.returncode}"
+
+            if attempt == 0 and ":" in serial:
+                adb("connect", serial, timeout=8)
+                time.sleep(0.25)
+
+    return None, last_error
 
 
 # ============ 设备信息 ============
@@ -276,8 +297,12 @@ def api_task_run(serial: str) -> dict:
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
+        env["ADB_PATH"] = ADB_PATH
         proc = subprocess.Popen(
-            [PYTHON_PATH, "-u", TAPTAP_SCRIPT, "--device", serial],
+            [
+                PYTHON_PATH, "-u", TAPTAP_SCRIPT,
+                "--device", serial, "--adb", ADB_PATH,
+            ],
             cwd=PROJECT_DIR,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -480,17 +505,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 截图 ----
     def _send_screenshot(self, serial: str):
-        try:
-            r = subprocess.run(
-                [ADB_PATH, "-s", serial, "exec-out", "screencap", "-p"],
-                capture_output=True,
-                timeout=15,
-            )
-            data = r.stdout.replace(b"\r\n", b"\n")  # 修复 Windows 下 screencap 的换行问题
-        except Exception:
-            data = b""
-        if not data or data.startswith(b"error"):
-            return self._send_json({"error": "截图失败（设备可能离线）"}, 500)
+        data, error = capture_screenshot(serial)
+        if data is None:
+            return self._send_json({"error": error or "截图失败（设备可能离线）"}, 503)
         self._send_bytes(data, "image/png")
 
 
@@ -511,11 +528,15 @@ def main():
     parser = argparse.ArgumentParser(description="ADB 设备管理 Web 服务")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址，默认 0.0.0.0（局域网可访问）")
     parser.add_argument("--port", type=int, default=8000, help="监听端口，默认 8000")
+    parser.add_argument("--adb", help="adb 可执行文件或 platform-tools 目录；默认自动查找")
     args = parser.parse_args()
 
-    ADB_PATH = find_adb()
+    ADB_PATH = find_adb(args.adb, base_dirs=[PROJECT_DIR])
     if not ADB_PATH:
-        print("[FAIL] 找不到 adb.exe，请安装 platform-tools 或设置环境变量")
+        print(
+            "[FAIL] 找不到 adb。请将 platform-tools 放入项目目录、加入 PATH，"
+            "或通过 --adb/ADB_PATH 指定。"
+        )
         return
 
     subprocess.run([ADB_PATH, "start-server"], capture_output=True, timeout=10)
