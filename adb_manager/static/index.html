@@ -121,6 +121,18 @@
   .secret-row .settings-input { flex: 1; min-width: 0; }
   .settings-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
   .settings-hint { color: var(--muted); font-size: 12px; line-height: 1.6; margin-top: 10px; }
+  .qr-card { width: min(430px, 94vw); text-align: center; }
+  .qr-canvas-wrap {
+    display: inline-flex; padding: 14px; margin: 4px auto 14px; border-radius: 16px;
+    background: #fff; box-shadow: 0 18px 55px rgba(0,0,0,.4), inset 0 0 0 1px rgba(0,0,0,.06);
+  }
+  #qrCanvas { width: min(360px, 76vw); height: min(360px, 76vw); image-rendering: pixelated; }
+  .qr-url {
+    padding: 9px 11px; border: 1px solid var(--line); border-radius: 9px;
+    background: rgba(3,10,25,.34); color: var(--text); font: 12px/1.5 Consolas, monospace;
+    word-break: break-all; user-select: all;
+  }
+  .qr-actions { display: flex; justify-content: center; gap: 8px; margin-top: 14px; }
   .pair-form { display: grid; grid-template-columns: 1fr 150px 1fr auto; gap: 10px; margin-top: 12px; }
   .pair-form input {
     background: var(--bg); border: 1px solid var(--line); color: var(--text);
@@ -377,6 +389,9 @@
 
   @media (max-width: 640px) {
     .brand span:last-child { display: none; }
+    .head-actions { gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+    .head-actions #lastRefresh, .head-actions label { display: none !important; }
+    .head-actions .btn { padding: 7px 9px; font-size: 12px; }
     main { padding: 0 14px; }
   }
 </style>
@@ -393,6 +408,7 @@
     <label class="muted" style="display:flex;align-items:center;gap:4px;">
       <input type="checkbox" id="autoRefresh" checked> 自动刷新
     </label>
+    <button class="btn" id="btnQrAccess">手机扫码访问</button>
     <button class="btn" id="btnSettings">设置</button>
     <button class="btn" id="btnRefresh">刷新</button>
   </div>
@@ -568,6 +584,23 @@
     <div class="settings-actions">
       <button class="btn" id="btnCancelSettings" type="button">取消</button>
       <button class="btn primary" id="btnSaveSettings" type="button">保存设置</button>
+    </div>
+  </div>
+</div>
+
+<!-- 手机扫码访问 -->
+<div class="modal" id="qrModal" role="dialog" aria-modal="true" aria-labelledby="qrTitle">
+  <div class="settings-card qr-card">
+    <div class="settings-head">
+      <h2 id="qrTitle">手机扫码访问</h2>
+      <span class="settings-close" id="qrClose" aria-label="关闭二维码">&times;</span>
+    </div>
+    <div class="qr-canvas-wrap"><canvas id="qrCanvas" width="360" height="360"></canvas></div>
+    <div class="qr-url" id="qrUrl">正在获取局域网地址…</div>
+    <div class="settings-hint">手机与电脑需要连接同一局域网；若无法访问，请允许防火墙放行当前服务端口。</div>
+    <div class="qr-actions">
+      <button class="btn" id="btnCopyQrUrl" type="button">复制链接</button>
+      <button class="btn primary" id="btnCloseQr" type="button">完成</button>
     </div>
   </div>
 </div>
@@ -1009,6 +1042,7 @@ document.getElementById("pvModal").addEventListener("click", e => {
 document.addEventListener("keydown", e => {
   if (e.key !== "Escape") return;
   if (document.getElementById("settingsModal").classList.contains("show")) closeSettings();
+  else if (document.getElementById("qrModal").classList.contains("show")) closeQrAccess();
   else if (document.getElementById("pvModal").classList.contains("show")) closePreview();
   else closeModal();
 });
@@ -1381,6 +1415,214 @@ function clearLog() {
   });
 }
 
+// ---------- 手机扫码访问（本地 Canvas 二维码，不请求外部服务） ----------
+let qrAccessUrl = "";
+
+function qrGfMultiply(x, y) {
+  let product = 0;
+  for (let i = 0; i < 8; i++) {
+    if (y & 1) product ^= x;
+    y >>>= 1;
+    x <<= 1;
+    if (x & 0x100) x ^= 0x11d;
+  }
+  return product;
+}
+
+function qrGeneratorPolynomial(degree) {
+  let polynomial = [1];
+  let root = 1;
+  for (let i = 0; i < degree; i++) {
+    const next = new Array(polynomial.length + 1).fill(0);
+    for (let j = 0; j < polynomial.length; j++) {
+      next[j] ^= polynomial[j];
+      next[j + 1] ^= qrGfMultiply(polynomial[j], root);
+    }
+    polynomial = next;
+    root = qrGfMultiply(root, 2);
+  }
+  return polynomial;
+}
+
+function qrErrorCorrection(data, degree) {
+  const generator = qrGeneratorPolynomial(degree);
+  const remainder = data.concat(new Array(degree).fill(0));
+  for (let i = 0; i < data.length; i++) {
+    const factor = remainder[i];
+    if (!factor) continue;
+    for (let j = 0; j < generator.length; j++) {
+      remainder[i + j] ^= qrGfMultiply(generator[j], factor);
+    }
+  }
+  return remainder.slice(data.length);
+}
+
+function qrAppendBits(bits, value, length) {
+  for (let i = length - 1; i >= 0; i--) bits.push((value >>> i) & 1);
+}
+
+function qrFormatBits(mask) {
+  const data = (1 << 3) | mask; // 纠错级别 L = 01
+  let remainder = data << 10;
+  const bitLength = value => {
+    let length = 0;
+    while (value) { length++; value >>>= 1; }
+    return length;
+  };
+  while (bitLength(remainder) >= bitLength(0x537)) {
+    remainder ^= 0x537 << (bitLength(remainder) - bitLength(0x537));
+  }
+  return ((data << 10) | remainder) ^ 0x5412;
+}
+
+function makeQrMatrix(text) {
+  // 固定使用 Version 5-L：最多容纳 106 个 UTF-8 字节，足够局域网 URL。
+  const version = 5;
+  const size = 17 + version * 4;
+  const dataCodewords = 108;
+  const errorCodewords = 26;
+  const bytes = [...new TextEncoder().encode(text)];
+  if (bytes.length > 106) throw new Error("访问链接过长，无法生成二维码");
+
+  const bits = [];
+  qrAppendBits(bits, 0b0100, 4);
+  qrAppendBits(bits, bytes.length, 8);
+  bytes.forEach(byte => qrAppendBits(bits, byte, 8));
+  const capacity = dataCodewords * 8;
+  qrAppendBits(bits, 0, Math.min(4, capacity - bits.length));
+  while (bits.length % 8) bits.push(0);
+  const data = [];
+  for (let i = 0; i < bits.length; i += 8) {
+    let value = 0;
+    for (let j = 0; j < 8; j++) value = (value << 1) | bits[i + j];
+    data.push(value);
+  }
+  for (let pad = 0; data.length < dataCodewords; pad++) data.push(pad % 2 ? 0x11 : 0xec);
+  const codewords = data.concat(qrErrorCorrection(data, errorCodewords));
+  const dataBits = [];
+  codewords.forEach(byte => qrAppendBits(dataBits, byte, 8));
+
+  const modules = Array.from({ length: size }, () => new Array(size).fill(false));
+  const reserved = Array.from({ length: size }, () => new Array(size).fill(false));
+  const setFunction = (x, y, dark) => {
+    if (x < 0 || y < 0 || x >= size || y >= size) return;
+    modules[y][x] = !!dark;
+    reserved[y][x] = true;
+  };
+  const drawFinder = (centerX, centerY) => {
+    for (let dy = -4; dy <= 4; dy++) for (let dx = -4; dx <= 4; dx++) {
+      const distance = Math.max(Math.abs(dx), Math.abs(dy));
+      setFunction(centerX + dx, centerY + dy, distance !== 2 && distance !== 4);
+    }
+  };
+  drawFinder(3, 3);
+  drawFinder(size - 4, 3);
+  drawFinder(3, size - 4);
+  for (let i = 8; i < size - 8; i++) {
+    setFunction(6, i, i % 2 === 0);
+    setFunction(i, 6, i % 2 === 0);
+  }
+  const alignmentCenter = 30;
+  for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+    const distance = Math.max(Math.abs(dx), Math.abs(dy));
+    setFunction(alignmentCenter + dx, alignmentCenter + dy, distance !== 1);
+  }
+
+  // 预留格式信息区域和固定深色模块。
+  for (let i = 0; i <= 5; i++) setFunction(8, i, false);
+  setFunction(8, 7, false); setFunction(8, 8, false); setFunction(7, 8, false);
+  for (let i = 9; i < 15; i++) setFunction(14 - i, 8, false);
+  for (let i = 0; i < 8; i++) setFunction(size - 1 - i, 8, false);
+  for (let i = 8; i < 15; i++) setFunction(8, size - 15 + i, false);
+  setFunction(8, size - 8, true);
+
+  let bitIndex = 0;
+  let upward = true;
+  for (let right = size - 1; right >= 1; right -= 2) {
+    if (right === 6) right--;
+    for (let vertical = 0; vertical < size; vertical++) {
+      const y = upward ? size - 1 - vertical : vertical;
+      for (let offset = 0; offset < 2; offset++) {
+        const x = right - offset;
+        if (reserved[y][x]) continue;
+        const bit = bitIndex < dataBits.length ? dataBits[bitIndex] : 0;
+        modules[y][x] = !!(bit ^ (((x + y) & 1) === 0)); // Mask 0
+        bitIndex++;
+      }
+    }
+    upward = !upward;
+  }
+
+  const format = qrFormatBits(0);
+  const formatBit = index => ((format >>> index) & 1) !== 0;
+  for (let i = 0; i <= 5; i++) setFunction(8, i, formatBit(i));
+  setFunction(8, 7, formatBit(6)); setFunction(8, 8, formatBit(7)); setFunction(7, 8, formatBit(8));
+  for (let i = 9; i < 15; i++) setFunction(14 - i, 8, formatBit(i));
+  for (let i = 0; i < 8; i++) setFunction(size - 1 - i, 8, formatBit(i));
+  for (let i = 8; i < 15; i++) setFunction(8, size - 15 + i, formatBit(i));
+  setFunction(8, size - 8, true);
+  return modules;
+}
+
+function drawQrCode(canvas, text) {
+  const matrix = makeQrMatrix(text);
+  const quietZone = 4;
+  const scale = 8;
+  const pixels = (matrix.length + quietZone * 2) * scale;
+  canvas.width = pixels;
+  canvas.height = pixels;
+  const context = canvas.getContext("2d");
+  context.imageSmoothingEnabled = false;
+  context.fillStyle = "#fff";
+  context.fillRect(0, 0, pixels, pixels);
+  context.fillStyle = "#050914";
+  matrix.forEach((row, y) => row.forEach((dark, x) => {
+    if (dark) context.fillRect((x + quietZone) * scale, (y + quietZone) * scale, scale, scale);
+  }));
+}
+
+async function openQrAccess() {
+  const modal = document.getElementById("qrModal");
+  const label = document.getElementById("qrUrl");
+  modal.classList.add("show");
+  label.textContent = "正在获取局域网地址…";
+  try {
+    const response = await fetch("/api/access-url", { cache: "no-store" });
+    const data = await response.json();
+    const localHosts = new Set(["127.0.0.1", "localhost", "0.0.0.0", "::1"]);
+    const currentUrl = localHosts.has(location.hostname) ? "" : location.origin + "/";
+    qrAccessUrl = currentUrl || data.lan_url || "";
+    if (!qrAccessUrl) throw new Error(data.message || "未检测到局域网地址");
+    drawQrCode(document.getElementById("qrCanvas"), qrAccessUrl);
+    label.textContent = qrAccessUrl;
+  } catch (error) {
+    qrAccessUrl = "";
+    label.textContent = "二维码生成失败：" + error.message;
+    toast(label.textContent, "err");
+  }
+}
+
+function closeQrAccess() {
+  document.getElementById("qrModal").classList.remove("show");
+}
+
+async function copyQrAccessUrl() {
+  if (!qrAccessUrl) return;
+  try {
+    await navigator.clipboard.writeText(qrAccessUrl);
+  } catch (_) {
+    const input = document.createElement("textarea");
+    input.value = qrAccessUrl;
+    input.style.position = "fixed";
+    input.style.opacity = "0";
+    document.body.appendChild(input);
+    input.select();
+    document.execCommand("copy");
+    input.remove();
+  }
+  toast("✓ 访问链接已复制", "ok");
+}
+
 // ---------- 提示 ----------
 function toast(msg, type) {
   const wrap = document.getElementById("toastWrap");
@@ -1396,12 +1638,19 @@ function toast(msg, type) {
 document.getElementById("btnConnect").addEventListener("click", doConnect);
 document.getElementById("btnPair").addEventListener("click", doPair);
 document.getElementById("btnRefresh").addEventListener("click", loadDevices);
+document.getElementById("btnQrAccess").addEventListener("click", openQrAccess);
 document.getElementById("btnSettings").addEventListener("click", openSettings);
 document.getElementById("settingsClose").addEventListener("click", closeSettings);
 document.getElementById("btnCancelSettings").addEventListener("click", closeSettings);
 document.getElementById("btnSaveSettings").addEventListener("click", saveSettings);
 document.getElementById("settingsModal").addEventListener("click", e => {
   if (e.target.id === "settingsModal") closeSettings();
+});
+document.getElementById("qrClose").addEventListener("click", closeQrAccess);
+document.getElementById("btnCloseQr").addEventListener("click", closeQrAccess);
+document.getElementById("btnCopyQrUrl").addEventListener("click", copyQrAccessUrl);
+document.getElementById("qrModal").addEventListener("click", e => {
+  if (e.target.id === "qrModal") closeQrAccess();
 });
 document.getElementById("taskCountry").addEventListener("change", saveCountry);
 document.getElementById("btnChooseAccount").addEventListener("click", () => {

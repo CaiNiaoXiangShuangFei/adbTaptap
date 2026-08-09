@@ -1171,6 +1171,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/settings":
             return self._send_json(api_settings_get())
 
+        if path == "/api/access-url":
+            ip = _lan_ip()
+            port = self.server.server_address[1]
+            return self._send_json({
+                "ok": bool(ip),
+                "lan_url": f"http://{ip}:{port}/" if ip else "",
+                "local_url": f"http://127.0.0.1:{port}/",
+                "message": "" if ip else "未检测到可供手机访问的局域网地址",
+            })
+
         if path == "/api/accounts":
             return self._send_json(api_accounts_get())
 
