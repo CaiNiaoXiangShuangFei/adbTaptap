@@ -114,6 +114,12 @@ JFBYM_TYPE = DEFAULT_JFBYM_TYPE
 # ============ 命令行参数 ============
 def parse_args():
     parser = argparse.ArgumentParser(description="TapTap 自动登录 + 下载脚本")
+    parser.add_argument(
+        "--flow",
+        choices=("new_account", "qq"),
+        default="new_account",
+        help="任务流程：new_account=新号全流程，qq=QQ号全流程",
+    )
     parser.add_argument("--device", "-d", help="设备 ID（IP:PORT 或序列号），不指定则列出可用设备")
     parser.add_argument("--adb", help="adb 可执行文件或 platform-tools 目录；默认自动查找")
     parser.add_argument("--sms-api", "--sms-link", dest="sms_api", help="当前账号的完整验证码提取链接", default=None)
@@ -971,6 +977,43 @@ def is_phone_login_entry_page(elements) -> bool:
     return is_login_page(elements) or is_saved_phone_login_page(elements)
 
 
+def find_qq_social_element(elements):
+    """查找登录页 QQ 社交入口；无语义标识时使用底部三个入口的中间项。"""
+    for elem in elements:
+        identity = " ".join((
+            elem.resource_id or "",
+            elem.text or "",
+            getattr(elem, "content_description", None) or "",
+        )).lower()
+        if "qq" in identity and elem.clickable:
+            return elem
+
+    screen_bottom = max((elem.rect[3] for elem in elements), default=0)
+    social_items = [
+        elem for elem in elements
+        if elem.clickable
+        and elem.rect[1] >= screen_bottom * 0.84
+        and 100 <= elem.rect[2] - elem.rect[0] <= 400
+        and elem.rect[3] - elem.rect[1] <= 350
+    ]
+    social_items.sort(key=lambda elem: (elem.rect[0], elem.rect[1]))
+    return social_items[len(social_items) // 2] if len(social_items) >= 3 else None
+
+
+def is_vivo_instance_chooser(elements) -> bool:
+    return _find_element_by_id_candidates(elements, [
+        "design_bottom_sheet",
+        "sheet_dialog_title",
+    ]) is not None and _find_element_by_id_candidates(elements, ["main"]) is not None
+
+
+def is_qq_authorization_page(elements) -> bool:
+    if any((elem.resource_id or "").startswith("com.tencent.mobileqq:") for elem in elements):
+        return True
+    markers = ("QQ授权", "QQ登录", "授权登录", "登录后将获得")
+    return any(elem.text and any(marker in elem.text for marker in markers) for elem in elements)
+
+
 def is_country_list_page(elements) -> bool:
     area_rows = [
         elem for elem in elements
@@ -1176,6 +1219,223 @@ def save_my_games_screenshot() -> str:
         return ""
     print(f"    [OK] 截图已保存: {path}")
     return path
+
+
+def _clickable_target_for_text(elements, texts):
+    """按文本定位按钮；文字本身不可点击时返回覆盖它的最小可点击容器。"""
+    text_elem = _find_element_by_text_candidates(elements, texts)
+    if text_elem is None:
+        return None
+    if text_elem.clickable:
+        return text_elem
+    center_x = (text_elem.rect[0] + text_elem.rect[2]) // 2
+    center_y = (text_elem.rect[1] + text_elem.rect[3]) // 2
+    containers = [
+        elem for elem in elements
+        if elem.clickable
+        and elem.rect[0] <= center_x <= elem.rect[2]
+        and elem.rect[1] <= center_y <= elem.rect[3]
+    ]
+    if containers:
+        return min(
+            containers,
+            key=lambda elem: (elem.rect[2] - elem.rect[0]) * (elem.rect[3] - elem.rect[1]),
+        )
+    return text_elem
+
+
+def perform_qq_login(login_elements) -> bool:
+    """从 TapTap 手机号登录页经 QQ 授权进入已登录的个人页或主页。"""
+    print("\n[QQ-1] 点击 QQ 登录入口...")
+    elements = login_elements or log_global_ui_elements("QQ-1 点击 QQ 图标前")
+    qq_social = find_qq_social_element(elements)
+    if qq_social is None:
+        print("    [FAIL] 未找到 QQ 社交登录入口")
+        return False
+    print(f"    找到 QQ 入口: {_elem_desc(qq_social)}")
+    _tap_elem(qq_social, "QQ 登录")
+
+    next_elements = wait_for_ui_condition(
+        lambda items: (
+            is_vivo_instance_chooser(items)
+            or is_qq_authorization_page(items)
+            or is_home_or_profile_page(items)
+        ),
+        timeout=5,
+    )
+    if next_elements is None:
+        print("    [FAIL] 点击 QQ 图标后未出现应用选择或 QQ 授权页面")
+        return False
+
+    if is_vivo_instance_chooser(next_elements):
+        print("\n[QQ-2] 处理“选择要使用的应用”弹窗...")
+        chooser_elements = (
+            log_global_ui_elements("QQ-2 选择 QQ 主应用前")
+            or next_elements
+        )
+        main_qq = _find_element_by_id_candidates(chooser_elements, ["main"])
+        if main_qq is None:
+            print("    [FAIL] 应用选择弹窗中未找到主 QQ")
+            return False
+        print(f"    选择主 QQ: {_elem_desc(main_qq)}")
+        _tap_elem(main_qq, "主 QQ")
+        next_elements = wait_for_ui_condition(
+            lambda items: is_qq_authorization_page(items) or is_home_or_profile_page(items),
+            timeout=6,
+        )
+        if next_elements is None:
+            print("    [FAIL] 选择主 QQ 后未出现授权页，也未返回 TapTap")
+            return False
+        print("    [OK] 主 QQ 点击已生效")
+
+    if is_home_or_profile_page(next_elements):
+        print("    [OK] QQ 已授权，已返回 TapTap")
+        return True
+
+    print("\n[QQ-3] 点击 QQ 授权同意...")
+    auth_elements = (
+        log_global_ui_elements("QQ-3 点击 QQ 同意前")
+        or next_elements
+    )
+    for attempt in range(1, 4):
+        if is_home_or_profile_page(auth_elements):
+            print("    [OK] QQ 授权成功，已返回 TapTap")
+            return True
+
+        agree = _clickable_target_for_text(auth_elements, [
+            "同意",
+            "授权并登录",
+            "同意并继续",
+            "确认登录",
+            "允许",
+        ])
+        if agree is None:
+            agree = next(
+                (
+                    elem for elem in auth_elements
+                    if elem.clickable
+                    and any(marker in (elem.resource_id or "").lower() for marker in (
+                        "agree", "authorize", "confirm", "login",
+                    ))
+                    and "cancel" not in (elem.resource_id or "").lower()
+                ),
+                None,
+            )
+        if agree is None:
+            print("    [FAIL] QQ 授权页未找到“同意”按钮")
+            return False
+        print(f"    找到 QQ 授权按钮: {_elem_desc(agree)}")
+        _tap_elem(agree, "QQ 授权同意")
+        completed = wait_for_ui_condition(is_home_or_profile_page, timeout=6)
+        if completed is not None:
+            print("    [OK] QQ 授权成功，已返回 TapTap")
+            return True
+        if attempt < 3:
+            print("    [WARN] 点击同意后尚未返回 TapTap，正在重试...")
+            auth_elements = get_ui_elements_safe(DEVICE_ID)
+    print("    [FAIL] QQ 授权后未进入 TapTap 主页或个人页")
+    return False
+
+
+def run_qq_game_download_flow() -> bool:
+    """QQ 登录完成后返回首页，搜索第一条游戏结果并启动下载。"""
+    print("\n[QQ-4] 回到 TapTap 首页...")
+    elements = log_global_ui_elements("QQ-4 返回首页前")
+    home_ready = False
+    for attempt in range(10):
+        if attempt > 0 or not elements:
+            elements = get_ui_elements_safe(DEVICE_ID)
+        if is_home_page(elements):
+            home_ready = True
+            print("    [OK] 已回到 TapTap 首页")
+            break
+        back(DEVICE_ID)
+        time.sleep(CLICK_RETRY_DELAY)
+    if not home_ready:
+        print("    [FAIL] QQ 流程无法回到 TapTap 首页")
+        return False
+
+    print(f"\n[QQ-5] 搜索游戏「{GAME_NAME}」...")
+    search_entry = _find_element_by_id_candidates(elements, [
+        "viewSearchContent",
+        "tsi_search_banner_key_text",
+        "tvSearchKey",
+    ])
+    if search_entry is None:
+        print("    [FAIL] 首页未找到搜索入口")
+        return False
+    _tap_elem(search_entry, "首页搜索入口")
+    search_elements = wait_for_ui_condition(is_search_page, timeout=CLICK_VERIFY_TIMEOUT)
+    if search_elements is None:
+        print("    [FAIL] 点击搜索入口后未进入搜索页面")
+        return False
+    search_elements = log_global_ui_elements("QQ-5 输入游戏名前") or search_elements
+    inputs = find_text_input_elements(search_elements)
+    if not inputs or not input_text_verified(inputs[0], GAME_NAME):
+        print("    [FAIL] 游戏名输入失败")
+        return False
+    search_button = _clickable_target_for_text(
+        get_ui_elements_safe(DEVICE_ID),
+        ["搜索"],
+    )
+    if search_button is None:
+        search_button = _find_element_by_id_candidates(
+            get_ui_elements_safe(DEVICE_ID),
+            ["tvSure"],
+        )
+    if search_button is not None:
+        _tap_elem(search_button, "搜索")
+    else:
+        result = adb_cmd("shell", "input", "keyevent", "66")
+        if result.returncode != 0:
+            print("    [FAIL] 搜索提交失败")
+            return False
+    result_elements = wait_for_ui_condition(
+        lambda items: search_results_visible(items, GAME_NAME),
+        timeout=6,
+    )
+    if result_elements is None:
+        print("    [FAIL] 未出现游戏搜索结果")
+        return False
+
+    print("\n[QQ-6] 点击第一条游戏并进入详情页...")
+    result_elements = log_global_ui_elements("QQ-6 点击第一条游戏前") or result_elements
+    first_result = find_first_game_result(result_elements)
+    if first_result is None:
+        print("    [FAIL] 未找到第一条游戏结果")
+        return False
+    _tap_elem(first_result, "第一条游戏结果")
+    detail_elements = wait_for_ui_condition(
+        lambda items: is_game_detail_page(items, GAME_NAME),
+        timeout=5,
+    )
+    if detail_elements is None:
+        print("    [FAIL] 点击第一条结果后未进入游戏详情页")
+        return False
+
+    print("\n[QQ-7] 点击下载...")
+    detail_elements = log_global_ui_elements("QQ-7 点击下载前") or detail_elements
+    download_button = _find_element_by_id_candidates(detail_elements, ["btn_container"])
+    if download_button is None:
+        download_button = _clickable_target_for_text(detail_elements, ["下载"])
+    if download_button is None:
+        print("    [FAIL] 游戏详情页未找到下载按钮")
+        return False
+    _tap_elem(download_button, "下载")
+    if wait_for_ui_condition(download_has_started, timeout=3) is None:
+        print("    [FAIL] 下载按钮点击后状态没有变化")
+        return False
+    print("    [OK] 下载已开始")
+
+    if ARGS.capture_screenshot:
+        delay_seconds = random.uniform(1.0, 2.0)
+        print(f"    [INFO] 已启用结果截图，等待 {delay_seconds:.1f} 秒...")
+        time.sleep(delay_seconds)
+        if not navigate_to_my_games() or not save_my_games_screenshot():
+            return False
+    else:
+        print("    [INFO] 未启用结果截图，直接完成当前 QQ 账号流程")
+    return True
 
 
 def is_username_or_home_page(elements) -> bool:
@@ -1635,6 +1895,7 @@ def main():
     log_path = _init_log()
     _log("=" * 60)
     _log("TapTap 自动登录脚本")
+    _log(f"任务流程: {'QQ号全流程' if ARGS.flow == 'qq' else '新号全流程'}")
     _log(f"日志文件: {log_path}")
     _log("=" * 60)
 
@@ -1858,6 +2119,22 @@ def main():
 
     if not avatar_found:
         _log("    [FAIL] 第 5 步未通过验证：未进入登录页")
+        return
+
+    if ARGS.flow == "qq":
+        qq_login_elements = (
+            log_global_ui_elements("QQ 流程进入社交登录前")
+            or login_entry_elements
+        )
+        if not perform_qq_login(qq_login_elements):
+            return
+        if not run_qq_game_download_flow():
+            return
+        _log("\n" + "=" * 60)
+        _log("QQ 号全流程完成！")
+        _log("=" * 60)
+        monitor.stop()
+        _WORKFLOW_COMPLETED = True
         return
 
     # 部分设备插有 SIM 卡或曾登录过，会先显示脱敏手机号的一键登录页。

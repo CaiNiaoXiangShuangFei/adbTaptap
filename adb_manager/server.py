@@ -708,6 +708,7 @@ def build_task_command(serial: str, settings: dict, account_path: str | None) ->
         "--device", serial,
         "--adb", ADB_PATH,
         "--country", settings["country"],
+        "--flow", settings.get("flow_type") or "new_account",
         "--jfbym-api", settings["jfbym_api_url"],
         "--jfbym-token", settings["jfbym_token"],
         "--jfbym-type", settings["jfbym_type"],
@@ -815,6 +816,10 @@ def _run_device_queue(task: dict, account_ids: list[str], settings: dict) -> Non
     _append_task_line(task, f"[系统] 目标游戏: {settings.get('game_name') or '-'}")
     _append_task_line(
         task,
+        f"[系统] 任务流程: {'QQ号全流程' if settings.get('flow_type') == 'qq' else '新号全流程'}",
+    )
+    _append_task_line(
+        task,
         f"[系统] 结果截图: {'启用' if settings.get('capture_screenshot') else '未启用'}",
     )
     for queue_index, account_id in enumerate(account_ids, 1):
@@ -908,8 +913,119 @@ def _run_device_queue(task: dict, account_ids: list[str], settings: dict) -> Non
     _append_task_line(task, "=" * 60)
 
 
-def api_task_run(serials, game_name: str, capture_result_screenshot: bool = False) -> dict:
-    """为每台选中设备启动一个线程，线程内按顺序逐个执行账号。"""
+def _run_qq_device_task(task: dict, settings: dict) -> None:
+    """QQ 流程每台设备只执行一次，不占用手机号账号队列。"""
+    serial = task["serial"]
+    _append_task_line(task, "=" * 60)
+    _append_task_line(task, f"[系统] QQ 号设备线程启动: {serial}")
+    _append_task_line(task, f"[系统] 目标游戏: {settings.get('game_name') or '-'}")
+    _append_task_line(
+        task,
+        f"[系统] 结果截图: {'启用' if settings.get('capture_screenshot') else '未启用'}",
+    )
+    with _TASK_LOCK:
+        task["progress"] = 1
+        task["current_phone"] = "QQ"
+    try:
+        command = build_task_command(serial, settings, None)
+        env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["ADB_PATH"] = ADB_PATH
+        proc = subprocess.Popen(
+            command,
+            cwd=PROJECT_DIR,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+        )
+        with _TASK_LOCK:
+            task["proc"] = proc
+        for line in proc.stdout:
+            _append_task_line(task, line)
+        return_code = proc.wait()
+    except Exception as exc:
+        return_code = -1
+        _append_task_line(task, f"[系统] QQ 任务启动失败: {exc}")
+    finally:
+        with _TASK_LOCK:
+            task["proc"] = None
+
+    stopped = task["stop_event"].is_set()
+    success = return_code == 0 and not stopped
+    with _TASK_LOCK:
+        task["current_phone"] = ""
+        task["completed"] = 1 if success else 0
+        task["failures"] = 0 if success else 1
+        task["status"] = "stopped" if stopped else "success" if success else "partial"
+    if success:
+        _append_task_line(task, "[系统] QQ 号全流程完成")
+    else:
+        reason = "用户停止任务" if stopped else f"任务退出码 {return_code}"
+        _append_task_line(task, f"[系统] QQ 号全流程未完成: {reason}")
+    _append_task_line(task, "=" * 60)
+
+
+def _start_qq_device_tasks(requested: list[str], settings: dict) -> dict:
+    with _TASK_LOCK:
+        busy = [
+            serial for serial in requested
+            if TASKS.get(serial, {}).get("status") == "running"
+        ]
+        if busy:
+            return {"ok": False, "message": "以下设备已有任务: " + ", ".join(busy)}
+        batch_id = f"batch_{int(time.time() * 1000)}"
+        threads = []
+        for serial in requested:
+            task = {
+                "id": f"{batch_id}_{hashlib.sha256(serial.encode('utf-8')).hexdigest()[:8]}",
+                "batch_id": batch_id,
+                "serial": serial,
+                "status": "running",
+                "lines": [],
+                "line_base": 0,
+                "started": time.strftime("%H:%M:%S"),
+                "ts": time.time(),
+                "proc": None,
+                "stop_event": threading.Event(),
+                "current_account_id": None,
+                "current_phone": "",
+                "progress": 0,
+                "total": 1,
+                "completed": 0,
+                "failures": 0,
+                "account_ids": [],
+                "remaining_account_ids": [],
+                "reserved_account_ids": [],
+            }
+            TASKS[serial] = task
+            threads.append(threading.Thread(
+                target=_run_qq_device_task,
+                args=(task, dict(settings)),
+                daemon=True,
+                name=f"taptap-qq-{serial}",
+            ))
+        for thread in threads:
+            thread.start()
+    return {
+        "ok": True,
+        "batch_id": batch_id,
+        "serials": list(requested),
+        "message": f"已在 {len(requested)} 台设备启动 QQ 号全流程",
+    }
+
+
+def api_task_run(
+    serials,
+    game_name: str,
+    flow_type: str = "new_account",
+    capture_result_screenshot: bool = False,
+) -> dict:
+    """启动所选流程：新号按账号队列运行，QQ 号按设备各运行一次。"""
     if not os.path.isfile(TAPTAP_SCRIPT):
         return {"ok": False, "message": f"找不到脚本: {TAPTAP_SCRIPT}"}
     game_name = str(game_name or "").strip()
@@ -917,6 +1033,9 @@ def api_task_run(serials, game_name: str, capture_result_screenshot: bool = Fals
         return {"ok": False, "message": "请输入游戏名"}
     if len(game_name) > 100:
         return {"ok": False, "message": "游戏名不能超过 100 个字符"}
+    flow_type = str(flow_type or "").strip()
+    if flow_type not in {"new_account", "qq"}:
+        return {"ok": False, "message": "不支持的任务流程"}
     if isinstance(serials, str):
         serials = [serials]
     requested = []
@@ -934,7 +1053,10 @@ def api_task_run(serials, game_name: str, capture_result_screenshot: bool = Fals
 
     settings = load_settings()
     settings["game_name"] = game_name
+    settings["flow_type"] = flow_type
     settings["capture_screenshot"] = capture_result_screenshot is True
+    if flow_type == "qq":
+        return _start_qq_device_tasks(requested, settings)
     with _TASK_LOCK:
         busy = [
             serial for serial in requested
@@ -1241,6 +1363,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(api_task_run(
                 data.get("serials") or data.get("serial", ""),
                 data.get("game_name", ""),
+                data.get("flow_type", "new_account"),
                 data.get("capture_screenshot") is True,
             ))
         if path == "/api/task/stop":

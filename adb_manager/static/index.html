@@ -463,6 +463,13 @@
     <h2>自动化任务</h2>
     <div class="task-config">
       <div class="config-field">
+        <label for="taskFlowType">任务流程</label>
+        <select id="taskFlowType" title="选择自动化任务流程">
+          <option value="new_account">新号全流程</option>
+          <option value="qq">QQ号全流程</option>
+        </select>
+      </div>
+      <div class="config-field">
         <label for="taskGameName">游戏名</label>
         <input class="settings-input" id="taskGameName" value="我的休闲时光" maxlength="100" autocomplete="off" spellcheck="false" placeholder="请输入需要搜索和下载的游戏名">
         <div class="settings-hint">
@@ -480,7 +487,7 @@
           <option value="Canada">加拿大 / 美国（+1，任一均可）</option>
         </select>
       </div>
-      <div class="config-field full">
+      <div class="config-field full" id="accountFileConfig">
         <label>账号文本文件</label>
         <div class="account-row">
           <input class="account-file" id="accountFile" type="file" accept=".txt,text/plain">
@@ -493,7 +500,7 @@
         <div class="settings-hint">常用格式：<code>账号----验证码提取链接</code>，例如 <code>3802662475----https://sms.example?token=xxx</code>。链接会原样 GET，不追加参数；相同手机号自动去重。</div>
       </div>
     </div>
-    <div class="account-table-wrap">
+    <div class="account-table-wrap" id="accountTableWrap">
       <table class="account-table">
         <thead><tr><th>序号</th><th>执行</th><th>账号</th><th>分配设备</th><th>状态</th><th>最近设备</th></tr></thead>
         <tbody id="accountsBody"><tr><td class="account-empty" colspan="6">请选择账号文本文件</td></tr></tbody>
@@ -1248,10 +1255,11 @@ const logTaskIds = new Map();
 async function runTask() {
   const serials = [...selectedDevices];
   const gameName = document.getElementById("taskGameName").value.trim();
+  const flowType = document.getElementById("taskFlowType").value;
   const captureScreenshot = document.getElementById("taskCaptureScreenshot").checked;
   if (!serials.length) { toast("请至少勾选一台在线设备", "err"); return; }
   if (!gameName) { toast("请输入游戏名", "err"); return; }
-  if (!accountQueue.some(account => account.selected && account.status !== "completed")) {
+  if (flowType === "new_account" && !accountQueue.some(account => account.selected && account.status !== "completed")) {
     toast("请至少勾选一个未完成账号", "err");
     return;
   }
@@ -1264,6 +1272,7 @@ async function runTask() {
       body: JSON.stringify({
         serials,
         game_name: gameName,
+        flow_type: flowType,
         capture_screenshot: captureScreenshot,
       })
     });
@@ -1386,7 +1395,8 @@ function updateRunControls() {
   const runnableAccounts = accountQueue.some(account => account.selected && !["completed", "queued", "running"].includes(account.status));
   const running = taskStates.some(task => task.status === "running");
   const hasGameName = !!document.getElementById("taskGameName").value.trim();
-  runBtn.disabled = !selectedDevices.size || !runnableAccounts || !hasGameName;
+  const isQqFlow = document.getElementById("taskFlowType").value === "qq";
+  runBtn.disabled = !selectedDevices.size || (!isQqFlow && !runnableAccounts) || !hasGameName;
   stopBtn.disabled = !running;
   const online = latestDevices.filter(device => device.state === "device");
   document.getElementById("btnSelectOnlineDevices").textContent =
@@ -1394,6 +1404,13 @@ function updateRunControls() {
       "取消勾选全部设备" : "勾选全部在线设备";
   document.getElementById("selectedDeviceSummary").textContent = selectedDevices.size ?
     "已勾选 " + selectedDevices.size + " 台设备；自动账号将均衡分配" : "未勾选设备";
+}
+
+function updateFlowUI() {
+  const isQqFlow = document.getElementById("taskFlowType").value === "qq";
+  document.getElementById("accountFileConfig").hidden = isQqFlow;
+  document.getElementById("accountTableWrap").hidden = isQqFlow;
+  updateRunControls();
 }
 
 async function stopTask() {
@@ -1658,6 +1675,7 @@ document.getElementById("qrModal").addEventListener("click", e => {
 });
 document.getElementById("taskCountry").addEventListener("change", saveCountry);
 document.getElementById("taskGameName").addEventListener("input", updateRunControls);
+document.getElementById("taskFlowType").addEventListener("change", updateFlowUI);
 document.getElementById("btnChooseAccount").addEventListener("click", () => {
   document.getElementById("accountFile").click();
 });
@@ -1740,6 +1758,7 @@ setInterval(() => {
   if (document.getElementById("autoRefresh").checked && !streamOn) loadDevices();
 }, 4000);
 
+updateFlowUI();
 loadDevices();
 loadAutomationSettings();
 loadAccounts();
