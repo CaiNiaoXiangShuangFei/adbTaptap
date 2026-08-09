@@ -675,6 +675,40 @@ def find_agreement_radio_element(elements):
     return None
 
 
+def find_agreement_control_element(elements):
+    """查找协议控件；兼容 UIAutomator 只暴露 protocol TextView 的版本。"""
+    radio = find_agreement_radio_element(elements)
+    if radio is not None:
+        return radio
+
+    protocol = _find_element_by_id_candidates(elements, ["protocol"])
+    if protocol is not None:
+        return protocol
+
+    return next(
+        (
+            elem
+            for elem in elements
+            if "勾选即代表同意" in (elem.text or "")
+            and "服务协议" in (elem.text or "")
+            and "隐私政策" in (elem.text or "")
+        ),
+        None,
+    )
+
+
+def tap_agreement_control(elem):
+    """点击协议 RadioButton；自定义控件只暴露文本时点击文本左侧圆点。"""
+    if "RadioButton" in (elem.class_name or ""):
+        _tap_elem(elem, "协议 RadioButton")
+        return
+
+    x1, y1, _, y2 = elem.rect
+    indicator_x = max(1, x1 - 40)
+    indicator_y = (y1 + y2) // 2
+    _tap_xy(indicator_x, indicator_y, "协议 RadioButton 左侧圆点")
+
+
 def agreement_radio_is_checked(elements) -> bool:
     radio = find_agreement_radio_element(elements)
     return radio is not None and bool(getattr(radio, "checked", False))
@@ -1351,9 +1385,8 @@ def main():
 
     handled = {"privacy": False}
     idle_rounds = 0
-    last_action_at = time.monotonic()
 
-    # “同意”后通知权限弹窗可能延迟数秒出现，不能一轮无弹窗就退出。
+    # “同意”后继续检测通知权限弹窗；连续两轮无弹窗即结束。
     for init_attempt in range(20):
         # 每轮只 dump 一次，所有查找共享
         try:
@@ -1422,12 +1455,11 @@ def main():
 
         if clicked:
             idle_rounds = 0
-            last_action_at = time.monotonic()
             time.sleep(1.2)
             continue
 
         idle_rounds += 1
-        if idle_rounds >= 6 and time.monotonic() - last_action_at >= 5:
+        if idle_rounds >= 2:
             print(f"    - 弹窗处理完毕（连续 {idle_rounds} 轮无更多弹窗）")
             break
         time.sleep(0.8)
@@ -1647,36 +1679,53 @@ def main():
     # ---- 第 8 步：勾选协议 RadioButton 并点击登录 ----
     print("\n[8] 勾选服务协议和隐私政策并点击登录...")
     log_global_ui_elements("8 勾选协议并登录前")
-    agreement_checked = False
+    agreement_ready = False
+    agreement_state_readable = False
     for attempt in range(1, 4):
         agreement_elements = get_ui_elements_safe(DEVICE_ID)
-        agreement_radio = find_agreement_radio_element(agreement_elements)
-        if agreement_radio is None:
-            print(f"    [WARN] 第 {attempt} 次未找到协议 RadioButton")
+        agreement_control = find_agreement_control_element(agreement_elements)
+        if agreement_control is None:
+            print(f"    [WARN] 第 {attempt} 次未找到协议控件或 protocol 文本")
             time.sleep(0.6)
             continue
 
-        if getattr(agreement_radio, "checked", False):
-            agreement_checked = True
-            print("    [OK] 协议 RadioButton 已是选中状态（checked=true）")
-            break
+        if "RadioButton" in (agreement_control.class_name or ""):
+            agreement_state_readable = True
+            if getattr(agreement_control, "checked", False):
+                agreement_ready = True
+                print("    [OK] 协议 RadioButton 已是选中状态（checked=true）")
+                break
 
-        print(f"      → 协议 RadioButton: {_elem_desc(agreement_radio)}")
-        _tap_elem(agreement_radio)
-        checked_elements = wait_for_ui_condition(
-            agreement_radio_is_checked,
-            timeout=3,
-            interval=0.3,
-        )
-        if checked_elements is not None:
-            agreement_checked = True
-            print("    [OK] 协议 RadioButton 已勾选并读回 checked=true")
-            break
-        print(f"    [WARN] 第 {attempt} 次点击后 RadioButton 仍未选中")
+            print(f"      → 协议 RadioButton: {_elem_desc(agreement_control)}")
+            tap_agreement_control(agreement_control)
+            checked_elements = wait_for_ui_condition(
+                agreement_radio_is_checked,
+                timeout=3,
+                interval=0.3,
+            )
+            if checked_elements is not None:
+                agreement_ready = True
+                print("    [OK] 协议 RadioButton 已勾选并读回 checked=true")
+                break
+            print(f"    [WARN] 第 {attempt} 次点击后 RadioButton 仍未选中")
+            continue
 
-    if not agreement_checked:
-        print("    [FAIL] 无法确认协议 RadioButton 已勾选，停止登录")
+        print(f"      → 协议区域: {_elem_desc(agreement_control)}")
+        tap_agreement_control(agreement_control)
+        agreement_ready = True
+        print("    [ACTION] 已点击 protocol 文本左侧圆点，等待登录跳转验证勾选结果")
+        break
+
+    if not agreement_ready:
+        print("    [FAIL] 无法找到或操作服务协议控件，停止登录")
         return
+
+    if not agreement_state_readable:
+        current_elements = get_ui_elements_safe(DEVICE_ID)
+        if find_agreement_control_element(current_elements) is None:
+            print("    [FAIL] 点击协议区域后登录页控件状态异常，停止登录")
+            return
+        print("    [INFO] 当前版本不暴露 checked 属性，将由登录页跳转作最终验证")
 
     login_clicked = find_and_tap_safe(text="登录", clickable=True, retries=5)
     if login_clicked:
@@ -1720,13 +1769,14 @@ def main():
             continue
 
         non_login_rounds = 0
-        agreement_radio = find_agreement_radio_element(elems)
-        if agreement_radio is None:
-            print("    [FAIL] 仍在登录页，但协议 RadioButton 已无法识别")
+        agreement_control = find_agreement_control_element(elems)
+        if agreement_control is None:
+            print("    [FAIL] 仍在登录页，但协议控件已无法识别")
             return
-        if not getattr(agreement_radio, "checked", False):
+        agreement_radio = find_agreement_radio_element(elems)
+        if agreement_radio is not None and not getattr(agreement_radio, "checked", False):
             print("    [WARN] 登录页协议 RadioButton 变为未选中，重新勾选并验证...")
-            _tap_elem(agreement_radio)
+            tap_agreement_control(agreement_radio)
             if wait_for_ui_condition(
                 agreement_radio_is_checked,
                 timeout=3,
@@ -1755,9 +1805,12 @@ def main():
         time.sleep(0.5)
 
     if not submission_verified:
-        print("    [FAIL] 协议虽已勾选，但点击登录后仍未离开登录页")
+        print("    [FAIL] 协议虽已操作，但点击登录后仍未离开登录页")
         return
-    print("    [OK] 第 8/9 步验证通过：RadioButton 已勾选且登录已提交")
+    if agreement_state_readable:
+        print("    [OK] 第 8/9 步验证通过：RadioButton 已勾选且登录已提交")
+    else:
+        print("    [OK] 第 8/9 步验证通过：协议区域点击已由登录页跳转确认")
 
     time.sleep(20)
     print("\n[9.5] 检查是否有安全验证...")
