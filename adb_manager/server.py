@@ -22,6 +22,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -47,6 +48,10 @@ from automation_config import (
     normalize_country,
     parse_accounts_text,
 )
+try:
+    from . import toolkit as device_toolkit
+except ImportError:  # 直接运行 adb_manager/server.py 时使用同目录模块
+    import toolkit as device_toolkit
 
 # 运行自动化脚本用的 Python：优先使用项目 venv
 _VENV_PY = os.path.join(PROJECT_DIR, ".venv", "Scripts", "python.exe")
@@ -194,7 +199,7 @@ def find_scrcpy(explicit: str | None = None) -> str | None:
     return None
 
 
-def api_open_native_preview(serial: str) -> dict:
+def api_open_native_preview(serial: str, virtual_display: bool = False) -> dict:
     """为指定在线设备打开独立本地预览窗口，优先使用 scrcpy。"""
     serial = str(serial or "").strip()
     if not serial:
@@ -207,7 +212,8 @@ def api_open_native_preview(serial: str) -> dict:
         for device, process in list(_native_preview_processes.items()):
             if process.poll() is not None:
                 _native_preview_processes.pop(device, None)
-        existing = _native_preview_processes.get(serial)
+        process_key = serial + ("::virtual" if virtual_display else "::main")
+        existing = _native_preview_processes.get(process_key)
         if existing and existing.poll() is None:
             return {"ok": True, "message": "该设备的本地预览窗口已经打开", "mode": "existing"}
 
@@ -216,8 +222,10 @@ def api_open_native_preview(serial: str) -> dict:
             command = [
                 scrcpy_path,
                 "-s", serial,
-                "--window-title", f"TapTap 本地实时预览 · {serial}",
+                "--window-title", ("TapTap 独立虚拟屏幕 · " if virtual_display else "TapTap 本地实时预览 · ") + serial,
             ]
+            if virtual_display:
+                command.extend(["--new-display", "--no-audio"])
             mode = "scrcpy"
             cwd = os.path.dirname(scrcpy_path)
         else:
@@ -229,6 +237,8 @@ def api_open_native_preview(serial: str) -> dict:
                 "--adb", ADB_PATH,
                 "--interval", "0.08",
             ]
+            if virtual_display:
+                return {"ok": False, "message": "独立虚拟屏幕需要 scrcpy，请确认项目 scrcpy 目录完整"}
             mode = "native-adb"
             cwd = PROJECT_DIR
 
@@ -248,10 +258,10 @@ def api_open_native_preview(serial: str) -> dict:
             )
         except OSError as exc:
             return {"ok": False, "message": f"本地预览启动失败: {exc}"}
-        _native_preview_processes[serial] = process
+        _native_preview_processes[process_key] = process
 
     if mode == "scrcpy":
-        message = "已打开 scrcpy 原生低延迟预览"
+        message = "已创建 scrcpy 独立虚拟屏幕" if virtual_display else "已打开 scrcpy 原生低延迟预览"
     else:
         message = "已打开本地 ADB 预览；安装 scrcpy 后程序会自动切换为更流畅的视频模式"
     return {"ok": True, "message": message, "mode": mode}
@@ -792,7 +802,7 @@ def api_device_clipboard(serial: str, operation: str, text_value: str = "") -> d
     return {"ok": False, "message": "不支持的剪贴板操作"}
 
 
-def api_dump_ui_elements(serial: str) -> dict:
+def api_dump_ui_elements(serial: str, include_elements: bool = False) -> dict:
     """抓取指定设备当前 UI 层级，并按逐元素 JSON 格式保存日志。"""
     serial = str(serial or "").strip()
     if not serial:
@@ -830,6 +840,7 @@ def api_dump_ui_elements(serial: str) -> dict:
             xml_bytes = xml_bytes[declaration_start:]
         elif xml_start >= 0:
             xml_bytes = xml_bytes[xml_start:]
+        elements = []
         try:
             xml_text = xml_bytes.decode("utf-8-sig", errors="strict")
         except UnicodeDecodeError as exc:
@@ -876,6 +887,15 @@ def api_dump_ui_elements(serial: str) -> dict:
                         "password": attributes.get("password") == "true",
                         "attributes": attributes,
                     }
+                    if include_elements:
+                        elements.append({
+                            key: element[key]
+                            for key in (
+                                "index", "resource_id", "text", "content_description",
+                                "class_name", "rect", "clickable", "enabled", "checkable",
+                                "checked", "scrollable",
+                            )
+                        })
                     file.write(
                         "[UI-ELEMENT] "
                         + json.dumps(element, ensure_ascii=False, separators=(",", ":"))
@@ -886,7 +906,7 @@ def api_dump_ui_elements(serial: str) -> dict:
             return {"ok": False, "message": f"页面元素日志保存失败: {exc}"}
 
     print(f"[UI] 设备 {serial} 当前页面元素已保存: {path} ({len(nodes)} 个)")
-    return {
+    response = {
         "ok": True,
         "message": f"已保存 {len(nodes)} 个页面元素",
         "serial": serial,
@@ -895,6 +915,9 @@ def api_dump_ui_elements(serial: str) -> dict:
         "folder": UI_DUMPS_DIR,
         "path": path,
     }
+    if include_elements:
+        response["elements"] = elements
+    return response
 
 
 # ============ 自动化任务（运行 taptap_auto_login.py） ============
@@ -1717,6 +1740,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_download(self, data: bytes, filename: str):
+        safe_name = os.path.basename(filename or "download.bin")
+        encoded = urllib.parse.quote(safe_name)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{encoded}")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _send_file(self, path):
         if not os.path.isfile(path):
             return self._send_json({"error": "not found"}, 404)
@@ -1733,14 +1767,19 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- 路由 ----
     def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path
+        parsed_url = urllib.parse.urlparse(self.path)
+        path = parsed_url.path
+        qs = urllib.parse.parse_qs(parsed_url.query)
 
         if path in ("/", "/index.html"):
             return self._send_file(os.path.join(STATIC_DIR, "index.html"))
 
         if path.startswith("/static/"):
             rel = os.path.relpath(path, "/static")
-            return self._send_file(os.path.join(STATIC_DIR, rel))
+            target = os.path.abspath(os.path.join(STATIC_DIR, rel))
+            if os.path.commonpath([STATIC_DIR, target]) != os.path.abspath(STATIC_DIR):
+                return self._send_json({"error": "not found"}, 404)
+            return self._send_file(target)
 
         if path == "/api/devices":
             return self._send_json({"ok": True, "devices": api_devices()})
@@ -1761,9 +1800,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/accounts":
             return self._send_json(api_accounts_get())
 
+        if path == "/api/recordings":
+            return self._send_json(device_toolkit.recordings_list())
+        if path == "/api/replay":
+            return self._send_json(device_toolkit.replay_state())
+        if path == "/api/plugins":
+            return self._send_json(device_toolkit.plugins_list())
+        if path == "/api/plugins/tasks":
+            offset_values = qs.get("offsets") or ["{}"]
+            offsets_raw = offset_values[0]
+            try:
+                offsets = json.loads(offsets_raw)
+            except ValueError:
+                offsets = {}
+            return self._send_json(device_toolkit.plugin_tasks(offsets))
+
         if path == "/api/task":
             offset = 0
-            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             if qs.get("offset"):
                 try:
                     offset = max(0, int(qs["offset"][0]))
@@ -1778,10 +1831,66 @@ class Handler(BaseHTTPRequestHandler):
             serial = urllib.parse.unquote(path[len("/api/devices/"):-len("/screenshot")])
             return self._send_screenshot(serial)
 
+        device_get = re.fullmatch(r"/api/devices/([^/]+)/(apps|files|logcat)", path)
+        if device_get:
+            serial = urllib.parse.unquote(device_get.group(1))
+            action = device_get.group(2)
+            if action == "apps":
+                return self._send_json(device_toolkit.list_apps(serial, (qs.get("scope") or ["third_party"])[0]))
+            if action == "files":
+                return self._send_json(device_toolkit.list_files(serial, (qs.get("path") or ["/sdcard"])[0]))
+            offset = 0
+            try: offset = max(0, int((qs.get("offset") or [0])[0]))
+            except (TypeError, ValueError): pass
+            return self._send_json(device_toolkit.logcat_state(serial, offset))
+
+        file_download = re.fullmatch(r"/api/devices/([^/]+)/files/download", path)
+        if file_download:
+            serial = urllib.parse.unquote(file_download.group(1))
+            remote = (qs.get("path") or [""])[0]
+            data, error = device_toolkit.read_remote_file(serial, remote)
+            if data is None:
+                return self._send_json({"ok": False, "message": error or "文件下载失败"}, 400)
+            return self._send_download(data, os.path.basename(remote))
+
         self._send_json({"error": "not found"}, 404)
 
     def do_POST(self):
+        parsed_url = urllib.parse.urlparse(self.path)
+        path = parsed_url.path
+        qs = urllib.parse.parse_qs(parsed_url.query)
         length = int(self.headers.get("Content-Length") or 0)
+        upload_match = re.fullmatch(r"/api/devices/([^/]+)/(install-apk|files/upload)", path)
+        if upload_match:
+            if length <= 0 or length > 1024 * 1024 * 1024:
+                return self._send_json({"ok": False, "message": "上传文件必须在 1 字节到 1 GB 之间"}, 413)
+            serial = urllib.parse.unquote(upload_match.group(1))
+            filename = (qs.get("filename") or ["upload.bin"])[0]
+            suffix = os.path.splitext(filename)[1][:16]
+            temp_path = ""
+            try:
+                with tempfile.NamedTemporaryFile(prefix="adb_manager_", suffix=suffix, delete=False) as temp:
+                    temp_path = temp.name
+                    remaining = length
+                    while remaining:
+                        chunk = self.rfile.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise OSError("上传连接提前断开")
+                        temp.write(chunk)
+                        remaining -= len(chunk)
+                if upload_match.group(2) == "install-apk":
+                    if not filename.lower().endswith(".apk"):
+                        return self._send_json({"ok": False, "message": "请选择 APK 文件"}, 400)
+                    result = device_toolkit.install_apk(serial, temp_path)
+                else:
+                    result = device_toolkit.push_file(serial, temp_path, (qs.get("path") or ["/sdcard"])[0], filename)
+                return self._send_json(result, 200 if result.get("ok") else 400)
+            except OSError as exc:
+                return self._send_json({"ok": False, "message": f"文件上传失败: {exc}"}, 500)
+            finally:
+                if temp_path:
+                    try: os.remove(temp_path)
+                    except OSError: pass
         if length > 2 * 1024 * 1024:
             return self._send_json({"ok": False, "message": "请求内容不能超过 2 MB"}, 413)
         raw = self.rfile.read(length) if length else b"{}"
@@ -1789,7 +1898,6 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(raw.decode("utf-8")) if raw.strip() else {}
         except Exception:
             data = {}
-        path = urllib.parse.urlparse(self.path).path
 
         if path == "/api/connect":
             return self._send_json(api_connect(data.get("address", "")))
@@ -1812,6 +1920,20 @@ class Handler(BaseHTTPRequestHandler):
             ))
         if path == "/api/task/log/clear":
             return self._send_json(api_task_clear_log(data.get("serial", "")))
+        if path == "/api/recordings/save":
+            return self._send_json(device_toolkit.recording_save(data.get("name", ""), data.get("actions", [])))
+        if path == "/api/recordings/delete":
+            return self._send_json(device_toolkit.recording_delete(data.get("id", "")))
+        if path == "/api/replay/run":
+            return self._send_json(device_toolkit.replay_run(data.get("recording_id", ""), data.get("serials", [])))
+        if path == "/api/replay/stop":
+            return self._send_json(device_toolkit.replay_stop(data.get("task_ids")))
+        if path == "/api/plugins/toggle":
+            return self._send_json(device_toolkit.plugin_toggle(data.get("id", ""), data.get("enabled") is True))
+        if path == "/api/plugins/run":
+            return self._send_json(device_toolkit.plugin_run(data.get("serials", []), data.get("plugin_ids")))
+        if path == "/api/plugins/stop":
+            return self._send_json(device_toolkit.plugin_stop(data.get("task_ids")))
         if path == "/api/settings":
             return self._send_json(api_settings_save(data))
         if path == "/api/accounts/import":
@@ -1840,6 +1962,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(api_disconnect(data.get("address", "")))
         if path == "/api/tcpip":
             return self._send_json(api_tcpip(data.get("serial", "")))
+
+        toolkit_match = re.fullmatch(
+            r"/api/devices/([^/]+)/(app|files/action|logcat|inspect-ui|virtual-display)",
+            path,
+        )
+        if toolkit_match:
+            serial = urllib.parse.unquote(toolkit_match.group(1))
+            action = toolkit_match.group(2)
+            if action == "app":
+                return self._send_json(device_toolkit.app_action(serial, data.get("package", ""), data.get("action", "")))
+            if action == "files/action":
+                return self._send_json(device_toolkit.file_action(serial, data.get("path", ""), data.get("action", ""), data.get("name", "")))
+            if action == "logcat":
+                return self._send_json(device_toolkit.logcat_control(serial, data.get("action", "")))
+            if action == "inspect-ui":
+                return self._send_json(api_dump_ui_elements(serial, include_elements=True))
+            return self._send_json(api_open_native_preview(serial, virtual_display=True))
 
         # 屏幕输入控制与本地预览：/api/devices/<serial>/...
         m = re.fullmatch(
@@ -1871,7 +2010,7 @@ class Handler(BaseHTTPRequestHandler):
             if action == "dump-ui":
                 return self._send_json(api_dump_ui_elements(serial))
             if action == "native-preview":
-                return self._send_json(api_open_native_preview(serial))
+                return self._send_json(api_open_native_preview(serial, data.get("virtual_display") is True))
 
         self._send_json({"error": "not found"}, 404)
 
@@ -1913,6 +2052,8 @@ def main():
         return
 
     subprocess.run([ADB_PATH, "start-server"], capture_output=True, timeout=10)
+    device_toolkit.configure(ADB_PATH, BASE_DIR)
+    os.environ["PYTHON_EXECUTABLE"] = PYTHON_PATH
     SCRCPY_PATH = find_scrcpy(args.scrcpy)
     print(f"[OK] 使用 adb: {ADB_PATH}")
     if SCRCPY_PATH:

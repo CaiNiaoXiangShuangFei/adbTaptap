@@ -1,0 +1,7 @@
+{
+  "id": "device_report",
+  "name": "设备信息报告",
+  "description": "示例插件：读取设备型号、Android 版本、电量和分辨率。可复制此目录开发新的自动化模组。",
+  "version": "1.0.0",
+  "entry": "run.py"
+}
