@@ -270,13 +270,15 @@ def load_account_state() -> dict:
 
 
 def _public_account(record: dict) -> dict:
-    return {
+    result = {
         key: record.get(key)
         for key in (
             "id", "position", "phone", "country", "selected", "assigned_device",
             "status", "last_device", "last_error", "completed_at",
         )
     }
+    result["has_sms_url"] = bool(record.get("sms_api_url"))
+    return result
 
 
 def api_accounts_get() -> dict:
@@ -709,7 +711,9 @@ def _run_device_queue(task: dict, account_ids: list[str], settings: dict) -> Non
         account_settings["country"] = record.get("country") or settings["country"]
         if record.get("sms_api_url"):
             account_settings["sms_api_url"] = record["sms_api_url"]
-        if record.get("sms_token"):
+            # 账号文件中的提取链接必须原样 GET，不追加全局 Token/Key。
+            account_settings["sms_token"] = ""
+        elif record.get("sms_token"):
             account_settings["sms_token"] = record["sms_token"]
         try:
             account_path = _prepare_account_file(record)

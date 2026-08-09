@@ -34,6 +34,7 @@ from automation_config import (
     DEFAULT_SMS_TOKEN,
     build_sms_api_url,
     country_candidates,
+    extract_sms_verification_code,
     load_account_file,
     normalize_country,
 )
@@ -1298,29 +1299,19 @@ def fetch_sms_code() -> str:
     """从 API 获取短信验证码。"""
     print(f"\n[获取验证码] 请求 SMS API...")
     try:
-        resp = requests.get(SMS_API_URL, timeout=10)
+        resp = requests.get(
+            SMS_API_URL,
+            timeout=(5, 10),
+            headers={
+                "Accept": "text/plain, application/json, */*",
+                "User-Agent": "Mozilla/5.0 TapTapAutomation/1.0",
+            },
+        )
         data = resp.text.strip()
         print(f"    API 返回: {data}")
 
-        # 格式1: yes|[TapTap]338016 is your...|(TapTap)|...
-        if data.startswith("yes|"):
-            parts = data.split("|")
-            if len(parts) >= 2:
-                msg = parts[1]
-                m = re.search(r'TapTap\D*(\d{6})', msg)
-                if not m:
-                    m = re.search(r'(?<!\d)(\d{6})(?!\d|\d{2}-\d{2})', msg)
-                if m:
-                    code = m.group(1)
-                    print(f"    [OK] 提取到验证码: {code}")
-                    return code
-
-        # TapTap 验证码固定 6 位数字，排除日期如 2026-07-29
-        m = re.search(r'TapTap\D*(\d{6})', data)
-        if not m:
-            m = re.search(r'(?<!\d)(\d{6})(?!\d|\d{2}-\d{2})', data)
-        if m:
-            code = m.group(1)
+        code = extract_sms_verification_code(data)
+        if code:
             print(f"    [OK] 提取到验证码: {code}")
             return code
 

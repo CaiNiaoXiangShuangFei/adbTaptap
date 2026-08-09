@@ -86,6 +86,23 @@ def build_sms_api_url(api_url: str | None, token: str | None) -> str:
     )
 
 
+def extract_sms_verification_code(data: str) -> str:
+    """从纯文本、JSON 或带分隔符的短信响应中提取 TapTap 6 位验证码。"""
+    text = str(data or "").strip()
+    if not text:
+        return ""
+    patterns = (
+        r"(?i)\[?TapTap\]?\D{0,48}(\d{6})(?!\d)",
+        r"(?i)(?:verification\s*code|verify\s*code|验证码|code)\D{0,24}(\d{6})(?!\d)",
+        r"(?<!\d)(\d{6})(?!\d)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return ""
+
+
 def _apply_account_value(result: dict[str, str], key: str, value) -> None:
     normalized_key = re.sub(r"[\s-]+", "_", str(key).strip().lower())
     target = _ACCOUNT_KEY_ALIASES.get(normalized_key)
@@ -221,9 +238,13 @@ def parse_accounts_text(content: str) -> list[dict[str, str]]:
                 stripped = line.strip()
                 if not stripped or stripped.startswith("#"):
                     continue
+                url_match = re.search(r"https?://[^\s]+", stripped, re.IGNORECASE)
+                direct_url = url_match.group(0).rstrip(",;，；") if url_match else ""
                 for phone in _extract_phone_numbers(stripped):
                     account = dict(common)
                     account["phone"] = phone
+                    if direct_url:
+                        account["sms_api_url"] = direct_url
                     if re.search(r"加拿大|\bcanada\b|\bCA\b", stripped, re.IGNORECASE):
                         account["country"] = "Canada"
                     elif re.search(
