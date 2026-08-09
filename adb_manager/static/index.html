@@ -170,6 +170,7 @@
   /* 设备卡片 */
   .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
   .section-head h2 { font-size: 16px; }
+  .preview-hint { margin: -6px 0 14px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
   .card {
     background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
@@ -540,6 +541,7 @@
     <h2>已连接设备 <span class="muted" id="deviceCount"></span></h2>
     <button class="btn" id="btnSelectOnlineDevices" type="button">勾选全部在线设备</button>
   </div>
+  <div class="connect-hint preview-hint">“本地实时预览”会打开独立桌面窗口；程序会自动查找 PATH、项目目录或 ADB 邻近目录中的 scrcpy，未找到时使用内置 ADB 预览。</div>
   <div class="grid" id="deviceGrid"></div>
 </main>
 
@@ -736,7 +738,8 @@ function cardHtml(d) {
   if (online) {
     actions += '<button class="btn" data-act="log" data-serial="' + esc(d.serial) + '">设备日志</button>';
     actions += '<button class="btn" data-act="dumpui" data-serial="' + esc(d.serial) + '">打印页面元素</button>';
-    actions += '<button class="btn" data-act="preview" data-serial="' + esc(d.serial) + '">实时预览</button>';
+    actions += '<button class="btn primary" data-act="nativepreview" data-serial="' + esc(d.serial) + '">本地实时预览</button>';
+    actions += '<button class="btn" data-act="preview" data-serial="' + esc(d.serial) + '">网页预览（兼容）</button>';
     actions += '<button class="btn" data-act="shot" data-serial="' + esc(d.serial) + '">截图</button>';
     if (d.type === "USB") {
       actions += '<button class="btn" data-act="tcpip" data-serial="' + esc(d.serial) + '">开启无线调试</button>';
@@ -898,6 +901,22 @@ async function dumpUiElements(serial, button) {
     );
     if (data && data.ok) {
       toast("✓ " + data.message + " · ui_dumps/" + data.filename, "ok");
+    }
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function openNativePreview(serial, button) {
+  if (button) button.disabled = true;
+  try {
+    const data = await apiPost(
+      "/api/devices/" + encodeURIComponent(serial) + "/native-preview",
+      {}
+    );
+    if (data && data.ok) {
+      const mode = data.mode === "scrcpy" ? "scrcpy" : "本地程序";
+      toast("✓ " + data.message + " · " + mode, "ok");
     }
   } finally {
     if (button) button.disabled = false;
@@ -1872,6 +1891,7 @@ grid.addEventListener("click", e => {
   const act = btn.dataset.act;
   const serial = btn.dataset.serial;
   if (act === "dumpui") dumpUiElements(serial, btn);
+  else if (act === "nativepreview") openNativePreview(serial, btn);
   else if (act === "log") {
     activeLogSerial = serial;
     if (!taskStates.some(task => task.serial === serial)) {

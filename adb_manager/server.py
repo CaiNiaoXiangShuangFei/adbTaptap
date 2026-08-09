@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -31,6 +32,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 PROJECT_DIR = os.path.dirname(BASE_DIR)  # 项目根目录（taptap_auto_login.py 所在目录）
 TAPTAP_SCRIPT = os.path.join(PROJECT_DIR, "taptap_auto_login.py")
+NATIVE_PREVIEW_SCRIPT = os.path.join(BASE_DIR, "native_preview.py")
 if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
@@ -50,6 +52,7 @@ _VENV_PY = os.path.join(PROJECT_DIR, ".venv", "Scripts", "python.exe")
 PYTHON_PATH = _VENV_PY if os.path.isfile(_VENV_PY) else sys.executable
 
 ADB_PATH = None
+SCRCPY_PATH = None
 
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 ACCOUNTS_DIR = os.path.join(BASE_DIR, "accounts")
@@ -72,6 +75,8 @@ _screenshot_lock = threading.Lock()
 _settings_lock = threading.Lock()
 _account_lock = threading.RLock()
 _ui_dump_lock = threading.Lock()
+_native_preview_lock = threading.Lock()
+_native_preview_processes: dict[str, subprocess.Popen] = {}
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
@@ -145,6 +150,110 @@ def capture_screenshot(serial: str) -> tuple[bytes | None, str | None]:
                 time.sleep(0.25)
 
     return None, last_error
+
+
+def find_scrcpy(explicit: str | None = None) -> str | None:
+    """动态查找 scrcpy；支持参数、环境变量、PATH 和项目/ADB 邻近目录。"""
+    configured = explicit or os.environ.get("SCRCPY_PATH")
+    candidates = []
+    if configured:
+        configured = os.path.expandvars(os.path.expanduser(str(configured).strip().strip('"')))
+        candidates.append(
+            os.path.join(configured, "scrcpy.exe") if os.path.isdir(configured) else configured
+        )
+    found = shutil.which("scrcpy") or shutil.which("scrcpy.exe")
+    if found:
+        candidates.append(found)
+
+    base_dirs = [PROJECT_DIR, BASE_DIR]
+    if ADB_PATH:
+        adb_dir = os.path.dirname(os.path.abspath(ADB_PATH))
+        base_dirs.extend([adb_dir, os.path.dirname(adb_dir)])
+    for base_dir in base_dirs:
+        candidates.extend([
+            os.path.join(base_dir, "scrcpy.exe"),
+            os.path.join(base_dir, "scrcpy", "scrcpy.exe"),
+        ])
+        try:
+            for entry in os.scandir(base_dir):
+                if entry.is_dir() and entry.name.lower().startswith("scrcpy"):
+                    candidates.append(os.path.join(entry.path, "scrcpy.exe"))
+        except OSError:
+            pass
+
+    seen = set()
+    for candidate in candidates:
+        path = os.path.abspath(candidate)
+        normalized = os.path.normcase(path)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def api_open_native_preview(serial: str) -> dict:
+    """为指定在线设备打开独立本地预览窗口，优先使用 scrcpy。"""
+    serial = str(serial or "").strip()
+    if not serial:
+        return {"ok": False, "message": "缺少设备序列号"}
+    online = {item["serial"] for item in list_devices_raw() if item["state"] == "device"}
+    if serial not in online:
+        return {"ok": False, "message": f"设备不在线: {serial}"}
+
+    with _native_preview_lock:
+        for device, process in list(_native_preview_processes.items()):
+            if process.poll() is not None:
+                _native_preview_processes.pop(device, None)
+        existing = _native_preview_processes.get(serial)
+        if existing and existing.poll() is None:
+            return {"ok": True, "message": "该设备的本地预览窗口已经打开", "mode": "existing"}
+
+        scrcpy_path = SCRCPY_PATH or find_scrcpy()
+        if scrcpy_path:
+            command = [
+                scrcpy_path,
+                "-s", serial,
+                "--window-title", f"TapTap 本地实时预览 · {serial}",
+            ]
+            mode = "scrcpy"
+            cwd = os.path.dirname(scrcpy_path)
+        else:
+            if not os.path.isfile(NATIVE_PREVIEW_SCRIPT):
+                return {"ok": False, "message": f"找不到本地预览程序: {NATIVE_PREVIEW_SCRIPT}"}
+            command = [
+                PYTHON_PATH, NATIVE_PREVIEW_SCRIPT,
+                "--device", serial,
+                "--adb", ADB_PATH,
+                "--interval", "0.08",
+            ]
+            mode = "native-adb"
+            cwd = PROJECT_DIR
+
+        env = dict(os.environ)
+        env["ADB"] = ADB_PATH
+        env["ADB_PATH"] = ADB_PATH
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            return {"ok": False, "message": f"本地预览启动失败: {exc}"}
+        _native_preview_processes[serial] = process
+
+    if mode == "scrcpy":
+        message = "已打开 scrcpy 原生低延迟预览"
+    else:
+        message = "已打开本地 ADB 预览；安装 scrcpy 后程序会自动切换为更流畅的视频模式"
+    return {"ok": True, "message": message, "mode": mode}
 
 
 # ============ 自动化设置与账号文件 ============
@@ -1548,8 +1657,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/tcpip":
             return self._send_json(api_tcpip(data.get("serial", "")))
 
-        # 屏幕输入控制：/api/devices/<serial>/tap|swipe|key
-        m = re.fullmatch(r"/api/devices/([^/]+)/(tap|swipe|key|dump-ui)", path)
+        # 屏幕输入控制与本地预览：/api/devices/<serial>/...
+        m = re.fullmatch(r"/api/devices/([^/]+)/(tap|swipe|key|dump-ui|native-preview)", path)
         if m:
             serial = urllib.parse.unquote(m.group(1))
             action = m.group(2)
@@ -1564,6 +1673,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(api_key(serial, data.get("key")))
             if action == "dump-ui":
                 return self._send_json(api_dump_ui_elements(serial))
+            if action == "native-preview":
+                return self._send_json(api_open_native_preview(serial))
 
         self._send_json({"error": "not found"}, 404)
 
@@ -1588,11 +1699,12 @@ def _lan_ip() -> str | None:
 
 
 def main():
-    global ADB_PATH
+    global ADB_PATH, SCRCPY_PATH
     parser = argparse.ArgumentParser(description="ADB 设备管理 Web 服务")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址，默认 0.0.0.0（局域网可访问）")
     parser.add_argument("--port", type=int, default=8000, help="监听端口，默认 8000")
     parser.add_argument("--adb", help="adb 可执行文件或 platform-tools 目录；默认自动查找")
+    parser.add_argument("--scrcpy", help="scrcpy 可执行文件或目录；默认自动查找")
     args = parser.parse_args()
 
     ADB_PATH = find_adb(args.adb, base_dirs=[PROJECT_DIR])
@@ -1604,7 +1716,12 @@ def main():
         return
 
     subprocess.run([ADB_PATH, "start-server"], capture_output=True, timeout=10)
+    SCRCPY_PATH = find_scrcpy(args.scrcpy)
     print(f"[OK] 使用 adb: {ADB_PATH}")
+    if SCRCPY_PATH:
+        print(f"[OK] 本地预览使用 scrcpy: {SCRCPY_PATH}")
+    else:
+        print("[INFO] 未找到 scrcpy，本地预览将使用内置 ADB 桌面窗口")
     print("[OK] 服务已启动，请在浏览器打开：")
     print(f"     本机访问:   http://127.0.0.1:{args.port}")
     ip = _lan_ip()
