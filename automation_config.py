@@ -9,6 +9,7 @@ from pathlib import Path
 
 DEFAULT_PHONE_NUMBER = "3412640535"
 DEFAULT_PHONE_COUNTRY = "auto"
+DEFAULT_GAME_NAME = "我的休闲时光"
 # 短信验证码链接由每条账号记录提供，不使用固定接口。
 DEFAULT_SMS_API_URL = ""
 DEFAULT_JFBYM_API_URL = "http://api.jfbym.com/api/YmServer/customApi"

@@ -21,3 +21,4 @@ adb_manager/accounts/
 adb_manager/account_queue.json
 adb_manager/device_logs/
 adb_manager/ui_dumps/
+taptap_screenshots/

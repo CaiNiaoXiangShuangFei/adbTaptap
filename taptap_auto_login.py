@@ -25,6 +25,7 @@ from PIL import Image
 
 from adb_locator import find_adb
 from automation_config import (
+    DEFAULT_GAME_NAME,
     DEFAULT_JFBYM_API_URL,
     DEFAULT_JFBYM_TOKEN,
     DEFAULT_JFBYM_TYPE,
@@ -99,7 +100,7 @@ TAPTAP_PACKAGE = "com.taptap"
 SMS_API_URL = DEFAULT_SMS_API_URL
 PHONE_NUMBER = DEFAULT_PHONE_NUMBER
 PHONE_COUNTRY = DEFAULT_PHONE_COUNTRY
-GAME_NAME = "我的休闲时光"
+GAME_NAME = DEFAULT_GAME_NAME
 GAME_PACKAGE = "com.zhixing.wdxxsg"
 
 DEFAULT_DEVICE_ID = "192.168.31.244:37145"
@@ -124,6 +125,11 @@ def parse_args():
     parser.add_argument("--jfbym-type", help="云码识别类型", default=None)
     parser.add_argument("--game", help="要搜索下载的游戏名", default=None)
     parser.add_argument("--game-package", help="目标游戏包名", default=None)
+    parser.add_argument(
+        "--install-and-launch",
+        action="store_true",
+        help="下载后继续等待安装并启动游戏（网页批量任务默认关闭）",
+    )
     return parser.parse_args()
 
 
@@ -1011,11 +1017,7 @@ def find_supported_country_element(elements, preferred_country: str):
 
 
 def is_search_page(elements) -> bool:
-    search_ids = (
-        "com.taptap:id/input_box",
-        "com.taptap:id/tvSure",
-    )
-    return any(find_element_by_id(resource_id, elements) for resource_id in search_ids) \
+    return _find_element_by_id_candidates(elements, ["input_box", "tvSure"]) is not None \
         or any("EditText" in (elem.class_name or "") for elem in elements)
 
 
@@ -1048,6 +1050,129 @@ def search_results_visible(elements, game_name: str) -> bool:
     return False
 
 
+def find_first_game_result(elements):
+    """查找搜索结果中的第一条游戏，并优先返回其可点击行容器。"""
+    titles = [
+        elem for elem in elements
+        if (elem.resource_id or "").endswith(":id/title")
+        and "EditText" not in (elem.class_name or "")
+    ]
+    if not titles:
+        return None
+    title = min(titles, key=lambda elem: (elem.rect[1], elem.rect[0]))
+    center_x = (title.rect[0] + title.rect[2]) // 2
+    center_y = (title.rect[1] + title.rect[3]) // 2
+    containers = [
+        elem for elem in elements
+        if elem.clickable
+        and elem.rect[0] <= center_x <= elem.rect[2]
+        and elem.rect[1] <= center_y <= elem.rect[3]
+    ]
+    if containers:
+        return min(
+            containers,
+            key=lambda elem: (elem.rect[2] - elem.rect[0]) * (elem.rect[3] - elem.rect[1]),
+        )
+    return title
+
+
+def is_main_navigation_page(elements) -> bool:
+    """识别 TapTap 带底部五栏导航的主页面。"""
+    main_ids = (
+        "tb_layout_home_bottom_bar",
+        "tb_layout_home_fragments",
+        "tb_home_drawer_layout_content",
+    )
+    if _find_element_by_id_candidates(elements, main_ids) is not None:
+        return True
+    screen_bottom = max((elem.rect[3] for elem in elements), default=0)
+    bottom_labels = sum(
+        1 for elem in elements
+        if elem.text in {"找游戏", "排行榜", "社区", "消息", "我的游戏"}
+        and elem.rect[3] >= screen_bottom * 0.85
+    )
+    return bottom_labels >= 3
+
+
+def is_my_games_page(elements) -> bool:
+    """使用“我的游戏”页面的稳定资源 ID 验证导航结果。"""
+    has_profile = _find_element_by_id_candidates(elements, ["click_layout"]) is not None
+    has_game_tabs = _find_element_by_id_candidates(elements, ["rv_tab"]) is not None
+    return has_profile and has_game_tabs
+
+
+def navigate_to_my_games() -> bool:
+    """从详情/搜索页逐级返回主导航，再进入右下角“我的游戏”。"""
+    print("\n[18] 返回 TapTap 首页并进入“我的游戏”...")
+    elements = log_global_ui_elements("18 返回首页前")
+    main_ready = False
+    for attempt in range(8):
+        if attempt > 0 or not elements:
+            elements = get_ui_elements_safe(DEVICE_ID)
+        if is_main_navigation_page(elements):
+            main_ready = True
+            print("    [OK] 已回到 TapTap 主导航页面")
+            break
+        back(DEVICE_ID)
+        time.sleep(CLICK_RETRY_DELAY)
+    if not main_ready:
+        print("    [FAIL] 第 18 步失败：无法回到 TapTap 主导航页面")
+        return False
+
+    for attempt in range(1, 3):
+        elements = get_ui_elements_safe(DEVICE_ID)
+        my_games_label = _find_element_by_text_candidates(elements, ["我的游戏"])
+        if my_games_label is not None:
+            _tap_elem(my_games_label, "我的游戏")
+        else:
+            # 底部导航没有暴露可读文本时，点击最右侧栏位中心。
+            screen_right = max((elem.rect[2] for elem in elements), default=1080)
+            screen_bottom = max((elem.rect[3] for elem in elements), default=2400)
+            _tap_xy(int(screen_right * 0.9), int(screen_bottom * 0.95), "我的游戏底部栏")
+        if wait_for_ui_condition(is_my_games_page, timeout=CLICK_VERIFY_TIMEOUT) is not None:
+            print("    [OK] 已验证进入“我的游戏”页面")
+            return True
+        if attempt < 2:
+            print("    [WARN] 点击后未进入“我的游戏”，正在重试...")
+    print("    [FAIL] 第 18 步失败：无法进入“我的游戏”页面")
+    return False
+
+
+def save_my_games_screenshot() -> str:
+    """按设备和账号保存“我的游戏”页面截图，成功时返回绝对路径。"""
+    print("\n[19] 截取“我的游戏”页面...")
+    elements = (
+        log_global_ui_elements("19 我的游戏截图前")
+        or get_ui_elements_safe(DEVICE_ID)
+    )
+    if not is_my_games_page(elements):
+        print("    [FAIL] 截图前页面验证失败：当前不是“我的游戏”页面")
+        return ""
+    safe_device = re.sub(r"[^0-9A-Za-z._-]+", "_", str(DEVICE_ID)).strip("._") or "device"
+    safe_phone = re.sub(r"\D", "", str(PHONE_NUMBER)) or "account"
+    screenshot_dir = os.path.join(_SCRIPT_DIR, "taptap_screenshots", safe_device)
+    os.makedirs(screenshot_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = os.path.abspath(os.path.join(screenshot_dir, f"{safe_phone}_{timestamp}.png"))
+    temp_path = path + ".tmp"
+    try:
+        screenshot = get_screenshot(DEVICE_ID)
+        screenshot.save(temp_path, format="PNG")
+        os.replace(temp_path, path)
+        if not os.path.isfile(path) or os.path.getsize(path) <= 8:
+            raise OSError("截图文件为空")
+    except Exception as exc:
+        try:
+            if os.path.isfile(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        print(f"    [FAIL] 截图保存失败: {exc}")
+        return ""
+    print(f"    [OK] 截图已保存: {path}")
+    return path
+
+
 def is_username_or_home_page(elements) -> bool:
     if is_home_page(elements):
         return True
@@ -1068,9 +1193,16 @@ def is_home_or_profile_page(elements) -> bool:
 
 
 def download_has_started(elements) -> bool:
-    state_markers = ("下载中", "暂停", "继续", "安装", "等待", "排队", "%")
-    return any(
+    state_markers = ("下载中", "暂停", "继续", "安装", "等待", "排队", "验证", "%")
+    if any(
         elem.text and any(marker in elem.text for marker in state_markers)
+        for elem in elements
+    ):
+        return True
+    return any(
+        any(marker in (elem.resource_id or "").lower() for marker in (
+            "download_progress", "progress_bar", "download_status",
+        ))
         for elem in elements
     )
 
@@ -2102,7 +2234,8 @@ def main():
     time.sleep(CLICK_SETTLE_DELAY)
 
     # ============================================================
-    # 后续操作：新账号用户名 → 搜索游戏 → 下载 → 安装 → 启动
+    # 后续操作：新账号用户名 → 搜索游戏 → 下载 → 我的游戏截图
+    # 仅命令行显式指定 --install-and-launch 时继续旧版安装/启动流程。
     # ============================================================
 
     # ---- 第 13 步：处理新账号用户名填写 ----
@@ -2272,9 +2405,13 @@ def main():
         text="搜索", clickable=True, retries=3
     )
     if not search_btn:
-        search_btn = find_and_tap_safe(
-            res_id="com.taptap:id/tvSure", clickable=True, retries=3
+        search_button = _find_element_by_id_candidates(
+            get_ui_elements_safe(DEVICE_ID),
+            ["tvSure"],
         )
+        if search_button is not None:
+            _tap_elem(search_button, "搜索")
+            search_btn = True
     if not search_btn:
         enter_result = adb_cmd("shell", "input", "keyevent", "66")
         if enter_result.returncode != 0:
@@ -2299,7 +2436,15 @@ def main():
     )
     game_clicked = False
 
-    # 1) 搜索完成后，过滤掉输入框本身，只找结果列表中的游戏名
+    # 1) 按页面顺序点击第一条游戏结果（附件页面中的稳定标题 ID 为 :id/title）。
+    first_result = find_first_game_result(elements)
+    if first_result is not None:
+        print(f"    [ACTION] 点击第一条游戏结果: {_elem_desc(first_result)}")
+        _tap_elem(first_result, "第一条游戏结果")
+        time.sleep(CLICK_SETTLE_DELAY)
+        game_clicked = True
+
+    # 2) 兼容旧版搜索结果：过滤掉输入框，只找目标游戏名。
     # 排除输入框（搜索栏里的文字）
     candidates = [
         e for e in elements
@@ -2312,7 +2457,7 @@ def main():
             if not (e.class_name and "EditText" in e.class_name)
         ]
     matches = find_elements_by_text(GAME_NAME, candidates, exact_match=False)
-    if matches:
+    if not game_clicked and matches:
         title_elem = matches[0]
         cx = (title_elem.rect[0] + title_elem.rect[2]) // 2
         cy = (title_elem.rect[1] + title_elem.rect[3]) // 2
@@ -2321,13 +2466,13 @@ def main():
         time.sleep(CLICK_SETTLE_DELAY)
         game_clicked = True
 
-    # 2) 备选：找 brand_app
+    # 3) 备选：找 brand_app
     if not game_clicked:
         game_clicked = find_and_tap_safe(
             res_id="com.taptap:id/brand_app", clickable=True, retries=3
         )
 
-    # 3) 再备选：找第一个游戏结果项
+    # 4) 再备选：找第一个游戏结果项
     if not game_clicked:
         print("    [WARN] 未找到品牌游戏，尝试点击第一个游戏结果...")
         for e in elements:
@@ -2393,18 +2538,35 @@ def main():
 
     # 2) 备选：btn_container
     if not download_clicked:
-        download_clicked = find_and_tap_safe(
-            res_id="com.taptap:id/btn_container", clickable=True, retries=3
-        )
+        download_button = _find_element_by_id_candidates(elements, ["btn_container"])
+        if download_button is not None:
+            _tap_elem(download_button, "下载")
+            download_clicked = True
 
     if not download_clicked:
         print("    [FAIL] 未找到下载按钮")
         return
 
-    if wait_for_ui_condition(download_has_started, timeout=8) is None:
+    if wait_for_ui_condition(download_has_started, timeout=3) is None:
         print("    [FAIL] 第 17 步未通过验证：下载状态没有发生变化")
         return
     print("    [OK] 下载点击已生效，已检测到下载/安装状态")
+
+    if not ARGS.install_and_launch:
+        delay_seconds = random.uniform(1.0, 2.0)
+        print(f"    [INFO] 下载已开始，等待 {delay_seconds:.1f} 秒后返回首页...")
+        time.sleep(delay_seconds)
+        if not navigate_to_my_games():
+            return
+        screenshot_path = save_my_games_screenshot()
+        if not screenshot_path:
+            return
+        _log("\n" + "=" * 60)
+        _log(f"当前账号流程完成，结果截图: {screenshot_path}")
+        _log("=" * 60)
+        monitor.stop()
+        _WORKFLOW_COMPLETED = True
+        return
 
     time.sleep(CLICK_SETTLE_DELAY)
     print("\n[18] 监控下载进度 & 处理安装弹窗...")

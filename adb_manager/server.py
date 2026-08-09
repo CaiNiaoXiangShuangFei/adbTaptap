@@ -716,6 +716,9 @@ def build_task_command(serial: str, settings: dict, account_path: str | None) ->
     if sms_url:
         # 每个账号的完整链接原样传递，不拼接固定 API、Token 或查询参数。
         command.extend(["--sms-api", sms_url])
+    game_name = str(settings.get("game_name") or "").strip()
+    if game_name:
+        command.extend(["--game", game_name])
     if account_path:
         command.extend(["--account-file", account_path])
     return command
@@ -807,6 +810,7 @@ def _run_device_queue(task: dict, account_ids: list[str], settings: dict) -> Non
     completed = 0
     _append_task_line(task, "=" * 60)
     _append_task_line(task, f"[系统] 设备线程启动: {serial} | 分配账号 {len(account_ids)} 个")
+    _append_task_line(task, f"[系统] 目标游戏: {settings.get('game_name') or '-'}")
     for queue_index, account_id in enumerate(account_ids, 1):
         if task["stop_event"].is_set():
             break
@@ -898,10 +902,15 @@ def _run_device_queue(task: dict, account_ids: list[str], settings: dict) -> Non
     _append_task_line(task, "=" * 60)
 
 
-def api_task_run(serials) -> dict:
+def api_task_run(serials, game_name: str) -> dict:
     """为每台选中设备启动一个线程，线程内按顺序逐个执行账号。"""
     if not os.path.isfile(TAPTAP_SCRIPT):
         return {"ok": False, "message": f"找不到脚本: {TAPTAP_SCRIPT}"}
+    game_name = str(game_name or "").strip()
+    if not game_name:
+        return {"ok": False, "message": "请输入游戏名"}
+    if len(game_name) > 100:
+        return {"ok": False, "message": "游戏名不能超过 100 个字符"}
     if isinstance(serials, str):
         serials = [serials]
     requested = []
@@ -918,6 +927,7 @@ def api_task_run(serials) -> dict:
         return {"ok": False, "message": "以下设备不在线: " + ", ".join(unavailable)}
 
     settings = load_settings()
+    settings["game_name"] = game_name
     with _TASK_LOCK:
         busy = [
             serial for serial in requested
@@ -1221,7 +1231,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/pair":
             return self._send_json(api_pair(data.get("address", ""), data.get("code", "")))
         if path == "/api/task/run":
-            return self._send_json(api_task_run(data.get("serials") or data.get("serial", "")))
+            return self._send_json(api_task_run(
+                data.get("serials") or data.get("serial", ""),
+                data.get("game_name", ""),
+            ))
         if path == "/api/task/stop":
             return self._send_json(api_task_stop(data.get("serials") or data.get("serial")))
         if path == "/api/task/log/clear":
