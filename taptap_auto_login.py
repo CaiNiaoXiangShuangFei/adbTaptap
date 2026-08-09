@@ -103,6 +103,12 @@ PHONE_COUNTRY = DEFAULT_PHONE_COUNTRY
 GAME_NAME = DEFAULT_GAME_NAME
 GAME_PACKAGE = "com.zhixing.wdxxsg"
 
+_NICKNAME_PREFIXES = (
+    "Aiden", "Blake", "Cody", "Dylan", "Evan", "Finn", "Gavin", "Hayden",
+    "Jamie", "Kai", "Leo", "Mason", "Nolan", "Owen", "Parker", "Quinn",
+    "Riley", "Sam", "Theo", "Wyatt", "Zane", "Nova", "Milo", "Luna",
+)
+
 DEFAULT_DEVICE_ID = "192.168.31.244:37145"
 
 # 云码识别配置（用于安全验证）
@@ -1665,6 +1671,11 @@ def is_username_or_home_page(elements) -> bool:
         return True
     if find_element_by_id("com.taptap:id/tv_user_name", elements):
         return True
+    if _find_element_by_id_candidates(elements, [
+        "register_nick_name_editor",
+        "register_confirm_button",
+    ]):
+        return True
     has_name_hint = any(
         elem.text and any(marker in elem.text for marker in ("用户名", "昵称", "取个名字"))
         for elem in elements
@@ -1677,6 +1688,14 @@ def is_home_or_profile_page(elements) -> bool:
     return is_home_page(elements) or bool(
         find_element_by_id("com.taptap:id/tv_user_name", elements)
     )
+
+
+def build_registration_nickname(phone_number: str) -> str:
+    """生成最长 15 字符的随机英文名字，并以手机号后 5 位结尾。"""
+    digits = re.sub(r"\D", "", str(phone_number or ""))
+    phone_suffix = digits[-5:] if len(digits) >= 5 else digits.zfill(5)
+    prefix = random.choice(_NICKNAME_PREFIXES)
+    return f"{prefix[:10]}{phone_suffix}"
 
 
 def download_has_started(elements) -> bool:
@@ -2757,33 +2776,57 @@ def main():
     if is_home_or_profile_page(username_elements):
         print("    [OK] 无需填写用户名，已验证进入个人页或主页")
     else:
-        input_elems = find_text_input_elements(username_elements)
-        if not input_elems:
+        nickname_input = _find_element_by_id_candidates(
+            username_elements,
+            ["register_nick_name_editor"],
+        )
+        if nickname_input is None:
+            input_elems = find_text_input_elements(username_elements)
+            nickname_input = input_elems[0] if input_elems else None
+        if nickname_input is None:
             print("    [FAIL] 用户名页面未找到输入框")
             return
 
-        random_name = "User" + str(random.randint(10000, 99999))
-        if not input_text_verified(input_elems[0], random_name):
+        random_name = build_registration_nickname(PHONE_NUMBER)
+        print(f"    [ACTION] 填写随机昵称（随机名字 + 手机号后5位）: {random_name}")
+        if not input_text_verified(nickname_input, random_name, exact=True):
             print("    [FAIL] 用户名输入后无法读回验证")
             return
         print(f"    [OK] 用户名已输入并验证: {random_name}")
 
         elements = get_ui_elements_safe(DEVICE_ID)
-        done_btn = None
-        for button_text in ["完成", "确定", "确认", "提交", "下一步"]:
-            done_btn = find_with_multiple_conditions(
-                text=button_text,
-                clickable=True,
-                exact_match=True,
-                elements=elements,
-                device_id=DEVICE_ID,
-            )
-            if done_btn:
-                break
+        done_btn = _find_element_by_id_candidates(elements, ["register_confirm_button"])
+        if done_btn is None:
+            for button_text in ["完成", "确定", "确认", "提交", "下一步"]:
+                done_btn = find_with_multiple_conditions(
+                    text=button_text,
+                    clickable=True,
+                    exact_match=True,
+                    elements=elements,
+                    device_id=DEVICE_ID,
+                )
+                if done_btn:
+                    break
         if not done_btn:
             print("    [FAIL] 用户名已输入，但未找到提交按钮")
             return
-        _tap_elem(done_btn)
+        if not getattr(done_btn, "enabled", True):
+            enabled_elements = wait_for_ui_condition(
+                lambda items: bool(
+                    (button := _find_element_by_id_candidates(
+                        items, ["register_confirm_button"],
+                    )) and getattr(button, "enabled", True)
+                ),
+                timeout=2,
+            )
+            if enabled_elements is not None:
+                done_btn = _find_element_by_id_candidates(
+                    enabled_elements, ["register_confirm_button"],
+                )
+        if not getattr(done_btn, "enabled", True):
+            print("    [FAIL] 昵称填写后“完成”按钮仍未启用")
+            return
+        _tap_elem(done_btn, "完成昵称注册")
         if wait_for_ui_condition(is_home_or_profile_page, timeout=6) is None:
             print("    [FAIL] 用户名提交后未进入个人页或主页")
             return

@@ -63,6 +63,9 @@ def extract_sms_verification_code(data: str) -> str:
     if not text:
         return ""
     patterns = (
+        # 兼容：yes|ÄTapTapÑ830081 is your verification code ...|(TapTap)|到期时间...
+        r"(?i)TapTap\D{0,24}(\d{6})(?!\d)",
+        r"(?i)(?<!\d)(\d{6})(?!\d)\s+is\s+your\s+(?:TapTap\s+)?(?:login\s+)?verification\s+code",
         r"(?i)\[?TapTap\]?\D{0,48}(\d{6})(?!\d)",
         r"(?i)(?:verification\s*code|verify\s*code|验证码|code)\D{0,24}(\d{6})(?!\d)",
         r"(?<!\d)(\d{6})(?!\d)",
