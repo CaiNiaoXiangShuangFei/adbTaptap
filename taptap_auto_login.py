@@ -1098,6 +1098,20 @@ def input_game_search_text(elements, game_name: str) -> bool:
             print(f"    [ACTION] 清除历史搜索词: {input_elem.text or '-'}")
             _tap_elem(clear_button, "清除历史搜索词")
             clear_with_keyboard = False
+        elif clear_with_keyboard:
+            # 部分 TapTap 版本没有输入框清除按钮，通用 clear_text 对该控件不生效。
+            # 输入框已聚焦时移动到末尾并逐字退格，随后立即输入，不等待空文本回读。
+            _tap_elem(input_elem, "聚焦游戏名输入框")
+            delete_count = max(len((input_elem.text or "").strip()), 1)
+            clear_result = adb_cmd(
+                "shell",
+                "input",
+                "keyevent",
+                "123",  # KEYCODE_MOVE_END
+                *(["67"] * delete_count),  # KEYCODE_DEL
+                timeout=8,
+            )
+            clear_with_keyboard = clear_result.returncode != 0
 
         if input_text_verified(input_elem, game_name, clear=clear_with_keyboard):
             print(f"    [OK] 游戏名已输入并验证: {game_name}")
@@ -1134,6 +1148,13 @@ def search_results_visible(elements, game_name: str) -> bool:
         if any(marker in resource_id for marker in ("brand_app", "search_result", "game_title")):
             return True
     return False
+
+
+def search_results_ready(elements, game_name: str) -> bool:
+    """搜索引导页已消失，且真正的结果列表已经出现。"""
+    if _find_element_by_id_candidates(elements, ["search_intro_content"]):
+        return False
+    return search_results_visible(elements, game_name)
 
 
 def find_first_game_result(elements):
@@ -1280,6 +1301,75 @@ def _clickable_target_for_text(elements, texts):
             key=lambda elem: (elem.rect[2] - elem.rect[0]) * (elem.rect[3] - elem.rect[1]),
         )
     return text_elem
+
+
+def _exact_search_suggestion_target(elements, game_name: str):
+    """返回与游戏名完全匹配的历史/推荐搜索标签及其点击容器。"""
+    for text_elem in elements:
+        if (text_elem.text or "").strip() != game_name.strip():
+            continue
+        if "EditText" in (text_elem.class_name or ""):
+            continue
+        resource_id = (text_elem.resource_id or "").lower()
+        if "tsi_tv_label" not in resource_id:
+            continue
+        center_x = (text_elem.rect[0] + text_elem.rect[2]) // 2
+        center_y = (text_elem.rect[1] + text_elem.rect[3]) // 2
+        containers = [
+            elem for elem in elements
+            if elem.clickable
+            and elem.rect[0] <= center_x <= elem.rect[2]
+            and elem.rect[1] <= center_y <= elem.rect[3]
+        ]
+        if containers:
+            return min(
+                containers,
+                key=lambda elem: (elem.rect[2] - elem.rect[0])
+                * (elem.rect[3] - elem.rect[1]),
+            )
+        return text_elem
+    return None
+
+
+def submit_game_search(elements, game_name: str):
+    """优先使用完全匹配的搜索标签，否则输入游戏名并点击搜索。"""
+    suggestion = _exact_search_suggestion_target(elements, game_name)
+    if suggestion is not None:
+        print(f"    [ACTION] 点击完全匹配的历史/推荐搜索词: {game_name}")
+        _tap_elem(suggestion, "历史/推荐搜索词")
+        result_elements = wait_for_ui_condition(
+            lambda items: search_results_ready(items, game_name),
+            timeout=6,
+        )
+        if result_elements is not None:
+            print("    [OK] 已通过历史/推荐搜索词进入结果页")
+            return result_elements
+        print("    [WARN] 搜索词点击后未进入结果页，改用输入框搜索...")
+        elements = get_ui_elements_safe(DEVICE_ID)
+
+    if not input_game_search_text(elements, game_name):
+        return None
+
+    search_button = _find_element_by_id_candidates(
+        get_ui_elements_safe(DEVICE_ID),
+        ["tvSure"],
+    )
+    if search_button is None:
+        search_button = _clickable_target_for_text(
+            get_ui_elements_safe(DEVICE_ID),
+            ["搜索"],
+        )
+    if search_button is not None:
+        _tap_elem(search_button, "搜索")
+    else:
+        enter_result = adb_cmd("shell", "input", "keyevent", "66")
+        if enter_result.returncode != 0:
+            return None
+
+    return wait_for_ui_condition(
+        lambda items: search_results_ready(items, game_name),
+        timeout=6,
+    )
 
 
 def perform_qq_login(login_elements) -> bool:
@@ -1440,31 +1530,9 @@ def run_qq_game_download_flow() -> bool:
         print("    [FAIL] 点击搜索入口后未进入搜索页面")
         return False
     search_elements = log_global_ui_elements("QQ-5 输入游戏名前") or search_elements
-    if not input_game_search_text(search_elements, GAME_NAME):
-        print("    [FAIL] 游戏名输入失败")
-        return False
-    search_button = _clickable_target_for_text(
-        get_ui_elements_safe(DEVICE_ID),
-        ["搜索"],
-    )
-    if search_button is None:
-        search_button = _find_element_by_id_candidates(
-            get_ui_elements_safe(DEVICE_ID),
-            ["tvSure"],
-        )
-    if search_button is not None:
-        _tap_elem(search_button, "搜索")
-    else:
-        result = adb_cmd("shell", "input", "keyevent", "66")
-        if result.returncode != 0:
-            print("    [FAIL] 搜索提交失败")
-            return False
-    result_elements = wait_for_ui_condition(
-        lambda items: search_results_visible(items, GAME_NAME),
-        timeout=6,
-    )
+    result_elements = submit_game_search(search_elements, GAME_NAME)
     if result_elements is None:
-        print("    [FAIL] 未出现游戏搜索结果")
+        print("    [FAIL] 游戏名输入或搜索提交失败")
         return False
 
     print("\n[QQ-6] 点击第一条游戏并进入详情页...")
@@ -2740,34 +2808,9 @@ def main():
     #     restore_keyboard(original_ime, DEVICE_ID)
     #     print("    [OK] 已输入搜索词")
     # else:
-    if not input_game_search_text(elements, GAME_NAME):
-        print("    [FAIL] 搜索词输入后无法从输入框读回验证")
-        return
-
-    time.sleep(CLICK_SETTLE_DELAY)
-    print("    点击搜索按钮...")
-    search_btn = find_and_tap_safe(
-        text="搜索", clickable=True, retries=3
-    )
-    if not search_btn:
-        search_button = _find_element_by_id_candidates(
-            get_ui_elements_safe(DEVICE_ID),
-            ["tvSure"],
-        )
-        if search_button is not None:
-            _tap_elem(search_button, "搜索")
-            search_btn = True
-    if not search_btn:
-        enter_result = adb_cmd("shell", "input", "keyevent", "66")
-        if enter_result.returncode != 0:
-            print("    [FAIL] 搜索按钮和回车提交均执行失败")
-            return
-
-    if wait_for_ui_condition(
-        lambda items: search_results_visible(items, GAME_NAME),
-        timeout=6,
-    ) is None:
-        print("    [FAIL] 第 15 步未通过验证：未出现搜索结果")
+    result_elements = submit_game_search(elements, GAME_NAME)
+    if result_elements is None:
+        print("    [FAIL] 第 15 步未通过验证：游戏名输入或搜索提交失败")
         return
     print("    [OK] 搜索已提交，目标游戏结果已出现")
 
@@ -2777,7 +2820,7 @@ def main():
     print(f"\n[16] 选择游戏「{GAME_NAME}」...")
     elements = (
         log_global_ui_elements("16 选择游戏前")
-        or get_ui_elements_safe(DEVICE_ID)
+        or result_elements
     )
     game_clicked = False
 
