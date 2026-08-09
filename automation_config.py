@@ -98,6 +98,34 @@ def _apply_account_value(result: dict[str, str], key: str, value) -> None:
         result[target] = text
 
 
+def _extract_phone_numbers(text: str) -> list[str]:
+    phones = []
+    for match in re.finditer(
+        r"(?<!\d)(?:\+?1[\s-]?)?([2-9]\d{2}[\s-]?\d{3}[\s-]?\d{4})(?!\d)",
+        text,
+    ):
+        phone = re.sub(r"\D", "", match.group(1))
+        if phone and phone not in phones:
+            phones.append(phone)
+    if phones:
+        return phones
+    for match in re.finditer(r"(?<!\d)(\d{7,15})(?!\d)", text):
+        phone = match.group(1)
+        if phone not in phones:
+            phones.append(phone)
+    return phones
+
+
+def _parse_account_mapping(payload: dict) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for key, value in payload.items():
+        _apply_account_value(result, key, value)
+    if not result.get("phone"):
+        raise ValueError("账号记录中未找到手机号")
+    result["phone"] = re.sub(r"\D", "", result["phone"])
+    return result
+
+
 def parse_account_text(content: str) -> dict[str, str]:
     """解析单账号文本，兼容 JSON、key=value 和普通手机号/API 文本。"""
     text = (content or "").lstrip("\ufeff").strip()
@@ -122,14 +150,9 @@ def parse_account_text(content: str) -> dict[str, str]:
             _apply_account_value(result, match.group(1), match.group(2))
 
     if "phone" not in result:
-        phone_match = re.search(
-            r"(?<!\d)(?:\+?1[\s-]?)?([2-9]\d{2}[\s-]?\d{3}[\s-]?\d{4})(?!\d)",
-            text,
-        )
-        if not phone_match:
-            phone_match = re.search(r"(?<!\d)(\d{7,15})(?!\d)", text)
-        if phone_match:
-            result["phone"] = re.sub(r"\D", "", phone_match.group(1))
+        phones = _extract_phone_numbers(text)
+        if phones:
+            result["phone"] = phones[0]
 
     if "sms_api_url" not in result:
         url_match = re.search(r"https?://[^\s]+", text)
@@ -145,6 +168,87 @@ def parse_account_text(content: str) -> dict[str, str]:
     if not result.get("phone"):
         raise ValueError("账号文件中未找到手机号")
     return result
+
+
+def parse_accounts_text(content: str) -> list[dict[str, str]]:
+    """解析多账号文本；支持 JSON 数组、分段配置和一行一个手机号。"""
+    text = (content or "").lstrip("\ufeff").strip()
+    if not text:
+        raise ValueError("账号文件为空")
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+
+    raw_accounts = None
+    if isinstance(payload, list):
+        raw_accounts = payload
+    elif isinstance(payload, dict) and isinstance(payload.get("accounts"), list):
+        raw_accounts = payload["accounts"]
+    elif isinstance(payload, dict):
+        raw_accounts = [payload]
+
+    accounts: list[dict[str, str]] = []
+    if raw_accounts is not None:
+        for item in raw_accounts:
+            if isinstance(item, dict):
+                accounts.append(_parse_account_mapping(item))
+            elif isinstance(item, (str, int)):
+                accounts.append(parse_account_text(str(item)))
+            else:
+                raise ValueError("JSON 账号列表包含不支持的记录")
+    else:
+        common: dict[str, str] = {}
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            match = re.match(r"^([^=：:]{1,32})\s*[=：:]\s*(.+)$", stripped)
+            if match:
+                normalized_key = re.sub(r"[\s-]+", "_", match.group(1).strip().lower())
+                if _ACCOUNT_KEY_ALIASES.get(normalized_key) != "phone":
+                    _apply_account_value(common, match.group(1), match.group(2))
+
+        blocks = [part.strip() for part in re.split(r"\r?\n\s*\r?\n", text) if part.strip()]
+        if len(blocks) > 1 and all(len(_extract_phone_numbers(block)) == 1 for block in blocks):
+            for block in blocks:
+                account = dict(common)
+                account.update(parse_account_text(block))
+                accounts.append(account)
+        else:
+            for line in text.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                for phone in _extract_phone_numbers(stripped):
+                    account = dict(common)
+                    account["phone"] = phone
+                    if re.search(r"加拿大|\bcanada\b|\bCA\b", stripped, re.IGNORECASE):
+                        account["country"] = "Canada"
+                    elif re.search(
+                        r"美国|\bunited\s*states\b|\bUSA?\b", stripped, re.IGNORECASE,
+                    ):
+                        account["country"] = "United States"
+                    accounts.append(account)
+            if not accounts:
+                account = dict(common)
+                account.update(parse_account_text(text))
+                accounts.append(account)
+
+    unique: list[dict[str, str]] = []
+    seen = set()
+    for account in accounts:
+        phone = re.sub(r"\D", "", account.get("phone", ""))
+        if not phone or phone in seen:
+            continue
+        account["phone"] = phone
+        account["country"] = normalize_country(account.get("country"))
+        seen.add(phone)
+        unique.append(account)
+    if not unique:
+        raise ValueError("账号文件中未找到有效手机号")
+    return unique
 
 
 def load_account_file(path: str | Path) -> dict[str, str]:

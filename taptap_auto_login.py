@@ -53,8 +53,9 @@ CLICK_POLL_INTERVAL = 0.25
 def _init_log():
     global _LOG_FILE
     log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)))
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(log_dir, f"taptap_log_{timestamp}.log")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    device_label = re.sub(r"[^0-9A-Za-z._-]+", "_", str(DEVICE_ID)).strip("._") or "device"
+    log_path = os.path.join(log_dir, f"taptap_log_{device_label}_{timestamp}.log")
     with _LOG_LOCK:
         _LOG_FILE = open(log_path, "w", encoding="utf-8")
     return log_path

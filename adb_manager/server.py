@@ -13,6 +13,7 @@ ADB 设备管理 Web 服务
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -41,9 +42,8 @@ from automation_config import (
     DEFAULT_PHONE_COUNTRY,
     DEFAULT_SMS_API_URL,
     DEFAULT_SMS_TOKEN,
-    load_account_file,
     normalize_country,
-    parse_account_text,
+    parse_accounts_text,
 )
 
 # 运行自动化脚本用的 Python：优先使用项目 venv
@@ -54,6 +54,8 @@ ADB_PATH = None
 
 SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 ACCOUNTS_DIR = os.path.join(BASE_DIR, "accounts")
+ACCOUNT_STATE_PATH = os.path.join(BASE_DIR, "account_queue.json")
+DEVICE_LOGS_DIR = os.path.join(BASE_DIR, "device_logs")
 DEFAULT_SETTINGS = {
     "country": DEFAULT_PHONE_COUNTRY,
     "sms_api_url": DEFAULT_SMS_API_URL,
@@ -61,7 +63,6 @@ DEFAULT_SETTINGS = {
     "jfbym_api_url": DEFAULT_JFBYM_API_URL,
     "jfbym_token": DEFAULT_JFBYM_TOKEN,
     "jfbym_type": DEFAULT_JFBYM_TYPE,
-    "account_file": "",
 }
 _SETTING_KEYS = set(DEFAULT_SETTINGS)
 
@@ -71,6 +72,7 @@ BATTERY_STATUS = {1: "未知", 2: "充电中", 3: "放电中", 4: "未充电", 5
 _state_lock = threading.Lock()
 _screenshot_lock = threading.Lock()
 _settings_lock = threading.Lock()
+_account_lock = threading.RLock()
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
@@ -165,34 +167,15 @@ def _write_settings_unlocked(settings: dict) -> None:
     os.replace(temp_path, SETTINGS_PATH)
 
 
-def _selected_account(settings: dict) -> tuple[str | None, dict | None, str | None]:
-    filename = os.path.basename(settings.get("account_file") or "")
-    if not filename:
-        return None, None, None
-    path = os.path.join(ACCOUNTS_DIR, filename)
-    try:
-        account = load_account_file(path)
-    except ValueError as exc:
-        return filename, None, str(exc)
-    return filename, account, None
-
-
 def api_settings_get() -> dict:
     settings = load_settings()
-    filename, account, account_error = _selected_account(settings)
     return {
         "ok": True,
-        "settings": {key: settings[key] for key in _SETTING_KEYS if key != "account_file"},
+        "settings": {key: settings[key] for key in _SETTING_KEYS},
         "countries": [
             {"value": value, "label": label}
             for value, label in COUNTRY_OPTIONS.items()
         ],
-        "account": {
-            "filename": filename,
-            "phone": (account or {}).get("phone"),
-            "country": (account or {}).get("country"),
-            "error": account_error,
-        } if filename else None,
     }
 
 
@@ -219,54 +202,217 @@ def api_settings_save(data: dict) -> dict:
     return result
 
 
-def api_account_select(filename: str, content: str) -> dict:
+# ============ 多账号队列 ============
+
+
+def _account_id(phone: str) -> str:
+    return hashlib.sha256(phone.encode("utf-8")).hexdigest()[:16]
+
+
+def _empty_account_state() -> dict:
+    return {"version": 1, "source_filename": "", "imported_at": "", "accounts": []}
+
+
+def _read_account_state_unlocked() -> dict:
+    state = _empty_account_state()
+    if os.path.isfile(ACCOUNT_STATE_PATH):
+        try:
+            with open(ACCOUNT_STATE_PATH, "r", encoding="utf-8") as file:
+                saved = json.load(file)
+            if isinstance(saved, dict) and isinstance(saved.get("accounts"), list):
+                state.update(saved)
+        except (OSError, ValueError):
+            pass
+
+    cleaned = []
+    seen = set()
+    for position, raw in enumerate(state.get("accounts", []), 1):
+        if not isinstance(raw, dict):
+            continue
+        phone = re.sub(r"\D", "", str(raw.get("phone") or ""))
+        if not phone or phone in seen:
+            continue
+        seen.add(phone)
+        status = str(raw.get("status") or "pending")
+        if status == "running":
+            status = "pending"
+        if status not in {"pending", "failed", "completed"}:
+            status = "pending"
+        record = {
+            "id": _account_id(phone),
+            "position": position,
+            "phone": phone,
+            "country": normalize_country(raw.get("country")),
+            "sms_api_url": str(raw.get("sms_api_url") or ""),
+            "sms_token": str(raw.get("sms_token") or ""),
+            "selected": bool(raw.get("selected", status != "completed")) and status != "completed",
+            "assigned_device": str(raw.get("assigned_device") or ""),
+            "status": status,
+            "last_device": str(raw.get("last_device") or ""),
+            "last_error": str(raw.get("last_error") or ""),
+            "completed_at": str(raw.get("completed_at") or ""),
+        }
+        cleaned.append(record)
+    state["accounts"] = cleaned
+    return state
+
+
+def _write_account_state_unlocked(state: dict) -> None:
+    temp_path = ACCOUNT_STATE_PATH + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as file:
+        json.dump(state, file, ensure_ascii=False, indent=2)
+    os.replace(temp_path, ACCOUNT_STATE_PATH)
+
+
+def load_account_state() -> dict:
+    with _account_lock:
+        return _read_account_state_unlocked()
+
+
+def _public_account(record: dict) -> dict:
+    return {
+        key: record.get(key)
+        for key in (
+            "id", "position", "phone", "country", "selected", "assigned_device",
+            "status", "last_device", "last_error", "completed_at",
+        )
+    }
+
+
+def api_accounts_get() -> dict:
+    state = load_account_state()
+    accounts = [_public_account(record) for record in state["accounts"]]
+    active_status = {}
+    with _TASK_LOCK:
+        for task in TASKS.values():
+            if task.get("status") != "running":
+                continue
+            for account_id in task.get("remaining_account_ids", task.get("account_ids", [])):
+                active_status[account_id] = "queued"
+            if task.get("current_account_id"):
+                active_status[task["current_account_id"]] = "running"
+    for account in accounts:
+        if account["id"] in active_status:
+            account["status"] = active_status[account["id"]]
+    return {
+        "ok": True,
+        "source_filename": state.get("source_filename", ""),
+        "imported_at": state.get("imported_at", ""),
+        "accounts": accounts,
+        "summary": {
+            "total": len(accounts),
+            "selected": sum(bool(item["selected"]) for item in accounts),
+            "completed": sum(item["status"] == "completed" for item in accounts),
+            "failed": sum(item["status"] == "failed" for item in accounts),
+        },
+    }
+
+
+def api_accounts_import(filename: str, content: str) -> dict:
+    if _active_account_ids():
+        return {"ok": False, "message": "有账号正在排队或运行，暂时不能重新导入"}
     original_name = os.path.basename(filename or "").strip()
     if not original_name.lower().endswith(".txt"):
         return {"ok": False, "message": "请选择 .txt 账号文件"}
     if not isinstance(content, str):
         return {"ok": False, "message": "账号文件内容无效"}
-    if len((content or "").encode("utf-8")) > 1024 * 1024:
+    if len(content.encode("utf-8")) > 1024 * 1024:
         return {"ok": False, "message": "账号文件不能超过 1 MB"}
     try:
-        account = parse_account_text(content)
+        parsed_accounts = parse_accounts_text(content)
     except ValueError as exc:
         return {"ok": False, "message": str(exc)}
 
-    stem, _ = os.path.splitext(original_name)
-    safe_stem = re.sub(r"[^0-9A-Za-z._\-\u4e00-\u9fff]+", "_", stem).strip("._")
-    safe_name = (safe_stem or "account")[:100] + ".txt"
-    os.makedirs(ACCOUNTS_DIR, exist_ok=True)
-    account_path = os.path.join(ACCOUNTS_DIR, safe_name)
-    try:
-        with open(account_path, "w", encoding="utf-8") as file:
-            file.write(content)
-    except OSError as exc:
-        return {"ok": False, "message": f"账号文件保存失败: {exc}"}
+    with _account_lock:
+        old_state = _read_account_state_unlocked()
+        old_by_phone = {item["phone"]: item for item in old_state["accounts"]}
+        records = []
+        for position, account in enumerate(parsed_accounts, 1):
+            phone = account["phone"]
+            previous = old_by_phone.get(phone, {})
+            previous_status = previous.get("status", "pending")
+            completed = previous_status == "completed"
+            records.append({
+                "id": _account_id(phone),
+                "position": position,
+                "phone": phone,
+                "country": normalize_country(account.get("country")),
+                "sms_api_url": str(account.get("sms_api_url") or ""),
+                "sms_token": str(account.get("sms_token") or ""),
+                "selected": bool(previous.get("selected", True)) and not completed,
+                "assigned_device": str(previous.get("assigned_device") or ""),
+                "status": "completed" if completed else previous_status if previous_status == "failed" else "pending",
+                "last_device": str(previous.get("last_device") or ""),
+                "last_error": str(previous.get("last_error") or ""),
+                "completed_at": str(previous.get("completed_at") or ""),
+            })
+        state = {
+            "version": 1,
+            "source_filename": original_name,
+            "imported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "accounts": records,
+        }
+        _write_account_state_unlocked(state)
 
-    with _settings_lock:
-        settings = _read_settings_unlocked()
-        settings["account_file"] = safe_name
-        if account.get("country"):
-            settings["country"] = normalize_country(account["country"])
-        _write_settings_unlocked(settings)
-    return {
-        "ok": True,
-        "message": f"已选择账号文件: {safe_name}",
-        "account": {
-            "filename": safe_name,
-            "phone": account.get("phone"),
-            "country": account.get("country"),
-        },
-        "settings": api_settings_get()["settings"],
-    }
+    result = api_accounts_get()
+    result["message"] = f"已解析 {len(parsed_accounts)} 个不重复账号"
+    return result
 
 
-def api_account_clear() -> dict:
-    with _settings_lock:
-        settings = _read_settings_unlocked()
-        settings["account_file"] = ""
-        _write_settings_unlocked(settings)
-    return {"ok": True, "message": "已取消选择账号文件", "account": None}
+def _active_account_ids() -> set[str]:
+    with _TASK_LOCK:
+        active = set()
+        for task in TASKS.values():
+            if task.get("status") == "running":
+                active.update(task.get("reserved_account_ids", task.get("account_ids", [])))
+        return active
+
+
+def api_account_update(account_id: str, selected=None, assigned_device=None) -> dict:
+    active_ids = _active_account_ids()
+    with _account_lock:
+        state = _read_account_state_unlocked()
+        record = next((item for item in state["accounts"] if item["id"] == account_id), None)
+        if not record:
+            return {"ok": False, "message": "账号不存在或账号列表已更新"}
+        if account_id in active_ids:
+            return {"ok": False, "message": "账号正在运行，暂时不能修改"}
+        if selected is not None:
+            if bool(selected) and record["status"] == "completed":
+                return {"ok": False, "message": "已完成账号不会重复执行"}
+            record["selected"] = bool(selected)
+        if assigned_device is not None:
+            device = str(assigned_device or "").strip()
+            if len(device) > 256:
+                return {"ok": False, "message": "设备序列号过长"}
+            record["assigned_device"] = device
+        _write_account_state_unlocked(state)
+    result = api_accounts_get()
+    result["message"] = "账号设置已保存"
+    return result
+
+
+def api_accounts_select_all(selected: bool) -> dict:
+    active_ids = _active_account_ids()
+    with _account_lock:
+        state = _read_account_state_unlocked()
+        for record in state["accounts"]:
+            if record["id"] not in active_ids and record["status"] != "completed":
+                record["selected"] = bool(selected)
+        _write_account_state_unlocked(state)
+    result = api_accounts_get()
+    result["message"] = "账号勾选状态已更新"
+    return result
+
+
+def api_accounts_clear() -> dict:
+    if _active_account_ids():
+        return {"ok": False, "message": "有账号正在运行，不能清空列表"}
+    with _account_lock:
+        _write_account_state_unlocked(_empty_account_state())
+    return {"ok": True, "message": "账号列表已清空", "accounts": [], "summary": {
+        "total": 0, "selected": 0, "completed": 0, "failed": 0,
+    }}
 
 
 # ============ 设备信息 ============
@@ -432,10 +578,11 @@ def api_key(serial: str, key) -> dict:
 # ============ 自动化任务（运行 taptap_auto_login.py） ============
 
 TASKS = {}
-_TASK_LOCK = threading.Lock()
+_TASK_LOCK = threading.RLock()
+_DEVICE_LOG_LOCK = threading.Lock()
 
 
-def build_task_command(serial: str, settings: dict, account_filename: str | None) -> list[str]:
+def build_task_command(serial: str, settings: dict, account_path: str | None) -> list[str]:
     command = [
         PYTHON_PATH, "-u", TAPTAP_SCRIPT,
         "--device", serial,
@@ -447,115 +594,375 @@ def build_task_command(serial: str, settings: dict, account_filename: str | None
         "--jfbym-token", settings["jfbym_token"],
         "--jfbym-type", settings["jfbym_type"],
     ]
-    if account_filename:
-        command.extend(["--account-file", os.path.join(ACCOUNTS_DIR, account_filename)])
+    if account_path:
+        command.extend(["--account-file", account_path])
     return command
 
 
-def api_task_run(serial: str) -> dict:
-    """启动 TapTap 自动登录脚本（子进程，实时采集日志）。同一时间只允许一个任务。"""
+def _safe_device_log_name(serial: str) -> str:
+    safe = re.sub(r"[^0-9A-Za-z._-]+", "_", serial).strip("._")[:80] or "device"
+    suffix = hashlib.sha256(serial.encode("utf-8")).hexdigest()[:8]
+    return f"{safe}_{suffix}.log"
+
+
+def _device_log_path(serial: str) -> str:
+    return os.path.join(DEVICE_LOGS_DIR, _safe_device_log_name(serial))
+
+
+def _append_task_line(task: dict, line: str) -> None:
+    text = str(line).rstrip("\r\n")
+    if not text:
+        return
+    with _TASK_LOCK:
+        task["lines"].append(text)
+        if len(task["lines"]) > 5000:
+            removed = len(task["lines"]) - 5000
+            task["lines"] = task["lines"][removed:]
+            task["line_base"] = task.get("line_base", 0) + removed
+    try:
+        os.makedirs(DEVICE_LOGS_DIR, exist_ok=True)
+        with _DEVICE_LOG_LOCK, open(_device_log_path(task["serial"]), "a", encoding="utf-8") as file:
+            file.write(text + "\n")
+    except OSError:
+        pass
+
+
+def _account_snapshot(account_id: str) -> dict | None:
+    with _account_lock:
+        state = _read_account_state_unlocked()
+        record = next((item for item in state["accounts"] if item["id"] == account_id), None)
+        return dict(record) if record else None
+
+
+def _prepare_account_file(record: dict) -> str:
+    os.makedirs(ACCOUNTS_DIR, exist_ok=True)
+    path = os.path.join(ACCOUNTS_DIR, f"queue_{record['id']}.txt")
+    payload = {
+        "phone": record["phone"],
+        "country": record.get("country") or "auto",
+    }
+    if record.get("sms_api_url"):
+        payload["sms_api_url"] = record["sms_api_url"]
+    if record.get("sms_token"):
+        payload["sms_token"] = record["sms_token"]
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
+    return path
+
+
+def _mark_account_started(account_id: str, serial: str) -> None:
+    with _account_lock:
+        state = _read_account_state_unlocked()
+        record = next((item for item in state["accounts"] if item["id"] == account_id), None)
+        if record:
+            record["last_device"] = serial
+            record["last_error"] = ""
+            _write_account_state_unlocked(state)
+
+
+def _mark_account_finished(account_id: str, serial: str, success: bool, error: str = "") -> None:
+    with _account_lock:
+        state = _read_account_state_unlocked()
+        record = next((item for item in state["accounts"] if item["id"] == account_id), None)
+        if not record:
+            return
+        record["last_device"] = serial
+        if success:
+            record["status"] = "completed"
+            record["selected"] = False
+            record["completed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            record["last_error"] = ""
+        else:
+            record["status"] = "failed"
+            record["selected"] = True
+            record["last_error"] = error or "自动化任务执行失败"
+        _write_account_state_unlocked(state)
+
+
+def _run_device_queue(task: dict, account_ids: list[str], settings: dict) -> None:
+    serial = task["serial"]
+    failures = 0
+    completed = 0
+    _append_task_line(task, "=" * 60)
+    _append_task_line(task, f"[系统] 设备线程启动: {serial} | 分配账号 {len(account_ids)} 个")
+    for queue_index, account_id in enumerate(account_ids, 1):
+        if task["stop_event"].is_set():
+            break
+        record = _account_snapshot(account_id)
+        if not record or not record.get("selected") or record.get("status") == "completed":
+            continue
+
+        with _TASK_LOCK:
+            task["current_account_id"] = account_id
+            task["current_phone"] = record["phone"]
+            task["progress"] = queue_index
+        _mark_account_started(account_id, serial)
+        _append_task_line(task, "-" * 60)
+        _append_task_line(
+            task,
+            f"[系统] 开始账号 {queue_index}/{len(account_ids)}: {record['phone']} | 设备: {serial}",
+        )
+
+        account_settings = dict(settings)
+        account_settings["country"] = record.get("country") or settings["country"]
+        if record.get("sms_api_url"):
+            account_settings["sms_api_url"] = record["sms_api_url"]
+        if record.get("sms_token"):
+            account_settings["sms_token"] = record["sms_token"]
+        try:
+            account_path = _prepare_account_file(record)
+            command = build_task_command(serial, account_settings, account_path)
+            env = dict(os.environ)
+            env["PYTHONUNBUFFERED"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["ADB_PATH"] = ADB_PATH
+            proc = subprocess.Popen(
+                command,
+                cwd=PROJECT_DIR,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=env,
+            )
+            with _TASK_LOCK:
+                task["proc"] = proc
+            for line in proc.stdout:
+                _append_task_line(task, line)
+            return_code = proc.wait()
+        except Exception as exc:
+            return_code = -1
+            _append_task_line(task, f"[系统] 账号任务启动失败: {exc}")
+        finally:
+            with _TASK_LOCK:
+                task["proc"] = None
+
+        stopped = task["stop_event"].is_set()
+        success = return_code == 0 and not stopped
+        if success:
+            completed += 1
+            _mark_account_finished(account_id, serial, True)
+            _append_task_line(task, f"[系统] 账号完成并自动取消勾选: {record['phone']}")
+        else:
+            failures += 1
+            reason = "用户停止任务" if stopped else f"任务退出码 {return_code}"
+            _mark_account_finished(account_id, serial, False, reason)
+            _append_task_line(task, f"[系统] 账号未完成，保留勾选供下次续跑: {record['phone']} | {reason}")
+        with _TASK_LOCK:
+            task["completed"] = completed
+            task["failures"] = failures
+            if account_id in task.get("remaining_account_ids", []):
+                task["remaining_account_ids"].remove(account_id)
+            if success and account_id in task.get("reserved_account_ids", []):
+                task["reserved_account_ids"].remove(account_id)
+        if stopped:
+            break
+
+    with _TASK_LOCK:
+        task["current_account_id"] = None
+        task["current_phone"] = ""
+        task["completed"] = completed
+        task["failures"] = failures
+        if task["stop_event"].is_set():
+            task["status"] = "stopped"
+        elif failures:
+            task["status"] = "partial"
+        else:
+            task["status"] = "success"
+    _append_task_line(
+        task,
+        f"[系统] 设备线程结束: 完成 {completed} 个，失败 {failures} 个，剩余账号下次可继续",
+    )
+    _append_task_line(task, "=" * 60)
+
+
+def api_task_run(serials) -> dict:
+    """为每台选中设备启动一个线程，线程内按顺序逐个执行账号。"""
     if not os.path.isfile(TAPTAP_SCRIPT):
         return {"ok": False, "message": f"找不到脚本: {TAPTAP_SCRIPT}"}
+    if isinstance(serials, str):
+        serials = [serials]
+    requested = []
+    for serial in serials or []:
+        serial = str(serial or "").strip()
+        if serial and serial not in requested:
+            requested.append(serial)
+    if not requested:
+        return {"ok": False, "message": "请至少勾选一台在线设备"}
+
+    online = {item["serial"] for item in list_devices_raw() if item["state"] == "device"}
+    unavailable = [serial for serial in requested if serial not in online]
+    if unavailable:
+        return {"ok": False, "message": "以下设备不在线: " + ", ".join(unavailable)}
+
     settings = load_settings()
-    account_filename, account, account_error = _selected_account(settings)
-    if account_filename and account_error:
-        return {"ok": False, "message": f"账号文件不可用: {account_error}"}
-
     with _TASK_LOCK:
-        for t in TASKS.values():
-            if t["status"] == "running":
-                return {"ok": False, "message": "已有任务在运行，请先等待完成或停止"}
-        task = {
-            "id": f"task_{int(time.time() * 1000)}",
-            "serial": serial,
-            "status": "running",
-            "lines": [],
-            "started": time.strftime("%H:%M:%S"),
-            "ts": time.time(),
-            "proc": None,
-        }
-        TASKS[task["id"]] = task
+        busy = [
+            serial for serial in requested
+            if TASKS.get(serial, {}).get("status") == "running"
+        ]
+        if busy:
+            return {"ok": False, "message": "以下设备已有任务: " + ", ".join(busy)}
+        active_ids = set()
+        for task in TASKS.values():
+            if task.get("status") == "running":
+                active_ids.update(task.get("reserved_account_ids", task.get("account_ids", [])))
 
-    command = build_task_command(serial, settings, account_filename)
+        state = load_account_state()
+        candidates = [
+            record for record in state["accounts"]
+            if record.get("selected") and record.get("status") != "completed"
+            and record["id"] not in active_ids
+        ]
+        if not candidates:
+            return {"ok": False, "message": "没有已勾选且未完成的账号"}
 
-    try:
-        env = dict(os.environ)
-        env["PYTHONUNBUFFERED"] = "1"
-        env["PYTHONIOENCODING"] = "utf-8"
-        env["ADB_PATH"] = ADB_PATH
-        proc = subprocess.Popen(
-            command,
-            cwd=PROJECT_DIR,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            env=env,
-        )
-    except Exception as e:
-        with _TASK_LOCK:
-            task["status"] = "error"
-            task["lines"].append(f"[系统] 任务启动失败: {e}")
-        return {"ok": False, "message": f"任务启动失败: {e}"}
+        queues = {serial: [] for serial in requested}
+        skipped_assigned = []
+        automatic = []
+        for record in candidates:
+            assigned = record.get("assigned_device") or ""
+            if assigned:
+                if assigned in queues:
+                    queues[assigned].append(record["id"])
+                else:
+                    skipped_assigned.append(record["phone"])
+            else:
+                automatic.append(record)
+        for record in automatic:
+            serial = min(requested, key=lambda item: (len(queues[item]), requested.index(item)))
+            queues[serial].append(record["id"])
 
-    task["proc"] = proc
-    if account_filename and account:
-        task["lines"].append(
-            f"[系统] 账号文件: {account_filename} | 手机号: {account.get('phone', '-')}"
-        )
-    task["lines"].append(
-        f"[系统] 国家设置: {COUNTRY_OPTIONS.get(settings['country'], settings['country'])}"
-    )
-    threading.Thread(target=_task_reader, args=(task["id"], proc), daemon=True).start()
-    return {"ok": True, "id": task["id"], "message": "任务已启动"}
-
-
-def _task_reader(task_id: str, proc) -> None:
-    task = TASKS.get(task_id)
-    try:
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            if line and task:
-                task["lines"].append(line)
-                if len(task["lines"]) > 2000:
-                    task["lines"] = task["lines"][-2000:]
-    except Exception:
-        pass
-    rc = proc.wait()
-    if task:
-        task["status"] = "success" if rc == 0 else "error"
-        task["lines"].append(f"[系统] 任务结束，退出码 {rc}")
-        task["proc"] = None
-
-
-def api_task_state(offset: int = 0) -> dict:
-    """返回最近一次任务的状态与新增日志行。"""
-    with _TASK_LOCK:
-        if not TASKS:
-            return {"task": None}
-        t = max(TASKS.values(), key=lambda x: x["ts"])
-        new_lines = t["lines"][offset:]
-        return {
-            "task": {
-                "id": t["id"],
-                "serial": t["serial"],
-                "status": t["status"],
-                "started": t["started"],
-                "lines": new_lines,
-                "total": len(t["lines"]),
+        batch_id = f"batch_{int(time.time() * 1000)}"
+        started = []
+        threads = []
+        for serial in requested:
+            account_ids = queues[serial]
+            if not account_ids:
+                continue
+            task = {
+                "id": f"{batch_id}_{hashlib.sha256(serial.encode('utf-8')).hexdigest()[:8]}",
+                "batch_id": batch_id,
+                "serial": serial,
+                "status": "running",
+                "lines": [],
+                "line_base": 0,
+                "started": time.strftime("%H:%M:%S"),
+                "ts": time.time(),
+                "proc": None,
+                "stop_event": threading.Event(),
+                "current_account_id": None,
+                "current_phone": "",
+                "progress": 0,
+                "total": len(account_ids),
+                "completed": 0,
+                "failures": 0,
+                "account_ids": list(account_ids),
+                "remaining_account_ids": list(account_ids),
+                "reserved_account_ids": list(account_ids),
             }
-        }
+            TASKS[serial] = task
+            thread = threading.Thread(
+                target=_run_device_queue,
+                args=(task, account_ids, dict(settings)),
+                daemon=True,
+                name=f"taptap-{serial}",
+            )
+            threads.append(thread)
+            started.append(serial)
+        if not started:
+            message = "所选设备没有可运行的账号"
+            if skipped_assigned:
+                message += "；部分账号已分配给其他设备"
+            return {"ok": False, "message": message}
+        for thread in threads:
+            thread.start()
+
+    message = f"已启动 {len(started)} 个设备线程，共分配 {sum(len(queues[s]) for s in started)} 个账号"
+    if skipped_assigned:
+        message += f"；跳过 {len(skipped_assigned)} 个分配给其他设备的账号"
+    return {"ok": True, "batch_id": batch_id, "serials": started, "message": message}
 
 
-def api_task_stop() -> dict:
+def _task_summary(task: dict) -> dict:
+    return {
+        "id": task["id"],
+        "batch_id": task.get("batch_id"),
+        "serial": task["serial"],
+        "status": task["status"],
+        "started": task["started"],
+        "current_phone": task.get("current_phone", ""),
+        "progress": task.get("progress", 0),
+        "total": task.get("total", 0),
+        "completed": task.get("completed", 0),
+        "failures": task.get("failures", 0),
+    }
+
+
+def api_task_overview() -> dict:
     with _TASK_LOCK:
-        for t in TASKS.values():
-            if t["status"] == "running" and t.get("proc"):
-                t["proc"].kill()
-                return {"ok": True, "message": "已发送停止指令，进程将被终止"}
-    return {"ok": False, "message": "当前没有运行中的任务"}
+        tasks = [_task_summary(task) for task in TASKS.values()]
+    return {"ok": True, "tasks": sorted(tasks, key=lambda item: item["serial"])}
+
+
+def api_task_state(serial: str, offset: int = 0) -> dict:
+    with _TASK_LOCK:
+        task = TASKS.get(serial)
+        if not task:
+            return {"task": None}
+        line_base = task.get("line_base", 0)
+        line_total = line_base + len(task["lines"])
+        reset = offset < line_base or offset > line_total
+        if reset:
+            offset = line_base
+        result = _task_summary(task)
+        result["lines"] = task["lines"][offset - line_base:]
+        result["line_total"] = line_total
+        result["reset"] = reset
+        return {"task": result}
+
+
+def api_task_stop(serials=None) -> dict:
+    requested = set(serials or []) if not isinstance(serials, str) else {serials}
+    stopped = []
+    with _TASK_LOCK:
+        for serial, task in TASKS.items():
+            if requested and serial not in requested:
+                continue
+            if task["status"] != "running":
+                continue
+            task["stop_event"].set()
+            proc = task.get("proc")
+            if proc:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            stopped.append(serial)
+    if stopped:
+        return {"ok": True, "message": f"已停止 {len(stopped)} 个设备任务", "serials": stopped}
+    return {"ok": False, "message": "当前没有匹配的运行中任务"}
+
+
+def api_task_clear_log(serial: str) -> dict:
+    if not serial:
+        return {"ok": False, "message": "请选择要清空日志的设备"}
+    with _TASK_LOCK:
+        task = TASKS.get(serial)
+        if task:
+            task["lines"] = []
+            task["line_base"] = 0
+    try:
+        os.makedirs(DEVICE_LOGS_DIR, exist_ok=True)
+        with _DEVICE_LOG_LOCK, open(_device_log_path(serial), "w", encoding="utf-8"):
+            pass
+    except OSError as exc:
+        return {"ok": False, "message": f"日志清空失败: {exc}"}
+    return {"ok": True, "message": f"已清空设备 {serial} 的日志"}
 
 
 def api_pair(address: str, code: str) -> dict:
@@ -640,6 +1047,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/settings":
             return self._send_json(api_settings_get())
 
+        if path == "/api/accounts":
+            return self._send_json(api_accounts_get())
+
         if path == "/api/task":
             offset = 0
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
@@ -648,7 +1058,10 @@ class Handler(BaseHTTPRequestHandler):
                     offset = max(0, int(qs["offset"][0]))
                 except ValueError:
                     offset = 0
-            return self._send_json(api_task_state(offset))
+            serial = (qs.get("serial") or [""])[0]
+            if serial:
+                return self._send_json(api_task_state(serial, offset))
+            return self._send_json(api_task_overview())
 
         if path.startswith("/api/devices/") and path.endswith("/screenshot"):
             serial = urllib.parse.unquote(path[len("/api/devices/"):-len("/screenshot")])
@@ -672,18 +1085,35 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/pair":
             return self._send_json(api_pair(data.get("address", ""), data.get("code", "")))
         if path == "/api/task/run":
-            return self._send_json(api_task_run(data.get("serial", "")))
+            return self._send_json(api_task_run(data.get("serials") or data.get("serial", "")))
         if path == "/api/task/stop":
-            return self._send_json(api_task_stop())
+            return self._send_json(api_task_stop(data.get("serials") or data.get("serial")))
+        if path == "/api/task/log/clear":
+            return self._send_json(api_task_clear_log(data.get("serial", "")))
         if path == "/api/settings":
             return self._send_json(api_settings_save(data))
+        if path == "/api/accounts/import":
+            return self._send_json(api_accounts_import(
+                data.get("filename", ""),
+                data.get("content", ""),
+            ))
+        if path == "/api/accounts/update":
+            return self._send_json(api_account_update(
+                data.get("id", ""),
+                data.get("selected") if "selected" in data else None,
+                data.get("assigned_device") if "assigned_device" in data else None,
+            ))
+        if path == "/api/accounts/select-all":
+            return self._send_json(api_accounts_select_all(bool(data.get("selected"))))
+        if path == "/api/accounts/clear":
+            return self._send_json(api_accounts_clear())
         if path == "/api/account/select":
-            return self._send_json(api_account_select(
+            return self._send_json(api_accounts_import(
                 data.get("filename", ""),
                 data.get("content", ""),
             ))
         if path == "/api/account/clear":
-            return self._send_json(api_account_clear())
+            return self._send_json(api_accounts_clear())
         if path == "/api/disconnect":
             return self._send_json(api_disconnect(data.get("address", "")))
         if path == "/api/tcpip":

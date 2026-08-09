@@ -80,6 +80,31 @@
   .account-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .account-file { display: none; }
   .account-meta { color: var(--muted); font-size: 12px; min-width: 0; word-break: break-all; }
+  .account-table-wrap { margin-top: 12px; border: 1px solid var(--line); border-radius: 9px; overflow: auto; }
+  .account-table { width: 100%; min-width: 760px; border-collapse: collapse; font-size: 12px; }
+  .account-table th, .account-table td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; }
+  .account-table th { position: sticky; top: 0; z-index: 1; background: var(--card2); color: var(--muted); font-weight: 600; }
+  .account-table tr:last-child td { border-bottom: 0; }
+  .account-table tr.account-completed { opacity: .62; }
+  .account-table tr.account-running { background: rgba(59, 130, 246, .08); }
+  .account-device-select {
+    width: 100%; min-width: 190px; background: var(--card2); border: 1px solid var(--line);
+    color: var(--text); padding: 6px 8px; border-radius: 6px; font-size: 12px;
+  }
+  .account-empty { padding: 24px !important; text-align: center !important; color: var(--muted); }
+  .task-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+  .selected-device-summary { color: var(--muted); font-size: 12px; margin-left: auto; }
+  .log-panel { margin-top: 12px; }
+  .log-tabs { display: flex; gap: 6px; flex-wrap: wrap; min-height: 32px; }
+  .log-tab {
+    border: 1px solid var(--line); background: var(--card2); color: var(--muted); border-radius: 7px;
+    padding: 6px 9px; font-size: 12px; cursor: pointer;
+  }
+  .log-tab.active { color: var(--text); border-color: var(--blue); background: rgba(59, 130, 246, .12); }
+  .log-tab.running::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: var(--green); }
+  .device-task-check { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; cursor: pointer; }
+  .device-task-check input, .account-table input[type="checkbox"] { accent-color: var(--blue); width: 15px; height: 15px; }
+  .card.device-selected { border-color: var(--blue); box-shadow: 0 0 0 1px rgba(59, 130, 246, .2); }
   .settings-card {
     width: min(680px, 94vw); max-height: 88vh; overflow: auto; background: var(--card);
     border: 1px solid var(--line); border-radius: var(--radius); padding: 22px;
@@ -257,29 +282,41 @@
         </select>
       </div>
       <div class="config-field">
-        <label>当前账号文本文件</label>
+        <label>账号文本文件</label>
         <div class="account-row">
           <input class="account-file" id="accountFile" type="file" accept=".txt,text/plain">
-          <button class="btn" id="btnChooseAccount" type="button">选择账号文件</button>
-          <button class="btn danger" id="btnClearAccount" type="button">取消选择</button>
-          <span class="account-meta" id="accountMeta">使用默认账号</span>
+          <button class="btn" id="btnChooseAccount" type="button">选择并解析账号文件</button>
+          <button class="btn" id="btnSelectAllAccounts" type="button">勾选未完成账号</button>
+          <button class="btn" id="btnUnselectAllAccounts" type="button">取消全部勾选</button>
+          <button class="btn danger" id="btnClearAccounts" type="button">清空列表</button>
+          <span class="account-meta" id="accountSummary">尚未导入账号</span>
         </div>
-        <div class="settings-hint">支持纯手机号、JSON，或 <code>phone=手机号</code>、<code>country=Canada</code> 格式。</div>
+        <div class="settings-hint">支持一行一个手机号、JSON 数组或分段键值格式。相同手机号自动去重，已完成进度会保留。</div>
       </div>
     </div>
-    <div class="connect-row">
-      <select id="taskDevice" class="task-select" title="选择目标设备"></select>
-      <button class="btn primary" id="btnRunTask">运行 TapTap 自动登录</button>
-      <button class="btn danger" id="btnStopTask" disabled>停止</button>
-      <button class="btn" id="btnClearLog">清空日志</button>
+    <div class="account-table-wrap">
+      <table class="account-table">
+        <thead><tr><th>序号</th><th>执行</th><th>账号</th><th>分配设备</th><th>状态</th><th>最近设备</th></tr></thead>
+        <tbody id="accountsBody"><tr><td class="account-empty" colspan="6">请选择账号文本文件</td></tr></tbody>
+      </table>
     </div>
-    <div class="task-status" id="taskStatus"></div>
-    <pre class="task-log" id="taskLog" placeholder="任务日志将在此实时显示…"></pre>
+    <div class="task-toolbar">
+      <button class="btn primary" id="btnRunTask" disabled>在勾选设备上同步运行</button>
+      <button class="btn danger" id="btnStopTask" disabled>停止全部设备任务</button>
+      <button class="btn" id="btnClearLog" disabled>清空当前设备日志</button>
+      <span class="selected-device-summary" id="selectedDeviceSummary">未勾选设备</span>
+    </div>
+    <div class="log-panel">
+      <div class="log-tabs" id="logTabs"><span class="muted">启动任务后，每台设备会在这里显示独立日志</span></div>
+      <div class="task-status" id="taskStatus"><span class="badge">空闲</span></div>
+      <pre class="task-log" id="taskLog">请选择设备日志…</pre>
+    </div>
   </div>
 
   <!-- 设备列表 -->
   <div class="section-head">
     <h2>已连接设备 <span class="muted" id="deviceCount"></span></h2>
+    <button class="btn" id="btnSelectOnlineDevices" type="button">勾选全部在线设备</button>
   </div>
   <div class="grid" id="deviceGrid"></div>
 </main>
@@ -368,29 +405,24 @@ const grid = document.getElementById("deviceGrid");
 const ipInput = document.getElementById("ipInput");
 const lastRefresh = document.getElementById("lastRefresh");
 const deviceCount = document.getElementById("deviceCount");
+let latestDevices = [];
+const selectedDevices = new Set();
 
 // ---------- 设备列表 ----------
 async function loadDevices() {
   try {
     const res = await fetch("/api/devices");
     const data = await res.json();
-    render(data.devices || []);
-    updateTaskDevices(data.devices || []);
+    latestDevices = data.devices || [];
+    const onlineSerials = new Set(latestDevices.filter(d => d.state === "device").map(d => d.serial));
+    [...selectedDevices].forEach(serial => { if (!onlineSerials.has(serial)) selectedDevices.delete(serial); });
+    render(latestDevices);
+    renderAccounts();
+    updateRunControls();
     lastRefresh.textContent = "最后刷新 " + new Date().toLocaleTimeString();
   } catch (e) {
     toast("刷新失败：" + e.message, "err");
   }
-}
-
-function updateTaskDevices(devices) {
-  const sel = document.getElementById("taskDevice");
-  const online = devices.filter(d => d.state === "device");
-  const cur = sel.value;
-  sel.innerHTML = online.map(d =>
-    '<option value="' + esc(d.serial) + '">' + esc(d.model || d.brand || d.serial) + " · " + esc(d.serial) + "</option>"
-  ).join("") || '<option value="">无在线设备</option>';
-  if (online.some(d => d.serial === cur)) sel.value = cur;
-  document.getElementById("btnRunTask").disabled = !online.length;
 }
 
 function render(devices) {
@@ -411,6 +443,7 @@ function stateBadge(state) {
 
 function cardHtml(d) {
   const online = d.state === "device";
+  const selected = online && selectedDevices.has(d.serial);
   const title = d.model || d.brand || "Android 设备";
   const rows = [];
   const addRow = (k, v) => { if (v) rows.push("<dt>" + k + "</dt><dd>" + esc(v) + "</dd>"); };
@@ -422,6 +455,7 @@ function cardHtml(d) {
 
   let actions = "";
   if (online) {
+    actions += '<button class="btn" data-act="log" data-serial="' + esc(d.serial) + '">设备日志</button>';
     actions += '<button class="btn" data-act="preview" data-serial="' + esc(d.serial) + '">实时预览</button>';
     actions += '<button class="btn" data-act="shot" data-serial="' + esc(d.serial) + '">截图</button>';
     if (d.type === "USB") {
@@ -438,12 +472,16 @@ function cardHtml(d) {
   }
 
   return `
-    <div class="card">
+    <div class="card${selected ? " device-selected" : ""}">
       <div class="card-top">
         <div class="card-title">${esc(title)}</div>
         <div class="badges">${stateBadge(d.state)}<span class="badge">${d.type}</span></div>
       </div>
       <div class="serial">${esc(d.serial)}</div>
+      <label class="device-task-check">
+        <input type="checkbox" data-device-check="${esc(d.serial)}" ${selected ? "checked" : ""} ${online ? "" : "disabled"}>
+        参与批量任务
+      </label>
       ${rows.length ? '<dl class="meta">' + rows.join("") + "</dl>" : ""}
       ${actions ? '<div class="actions">' + actions + "</div>" : ""}
     </div>`;
@@ -757,22 +795,9 @@ document.addEventListener("keydown", e => {
 
 // ---------- 账号与设置 ----------
 let automationSettings = null;
-
-function renderAccount(account) {
-  const meta = document.getElementById("accountMeta");
-  const clearBtn = document.getElementById("btnClearAccount");
-  if (!account || !account.filename) {
-    meta.textContent = "使用默认账号";
-    clearBtn.disabled = true;
-    return;
-  }
-  const details = [account.filename];
-  if (account.phone) details.push("手机号 " + account.phone);
-  if (account.country) details.push(account.country);
-  if (account.error) details.push("读取失败：" + account.error);
-  meta.textContent = details.join(" · ");
-  clearBtn.disabled = false;
-}
+let accountQueue = [];
+let accountSummary = { total: 0, selected: 0, completed: 0, failed: 0 };
+let accountSourceFilename = "";
 
 function applySettingsPayload(payload) {
   if (!payload) return;
@@ -790,7 +815,6 @@ function applySettingsPayload(payload) {
   document.getElementById("settingJfbymApi").value = settings.jfbym_api_url || "";
   document.getElementById("settingJfbymToken").value = settings.jfbym_token || "";
   document.getElementById("settingJfbymType").value = settings.jfbym_type || "";
-  if (Object.prototype.hasOwnProperty.call(payload, "account")) renderAccount(payload.account);
 }
 
 async function loadAutomationSettings() {
@@ -853,9 +877,9 @@ async function selectAccountFile(file) {
   }
   try {
     const content = await file.text();
-    const data = await apiPost("/api/account/select", { filename: file.name, content });
+    const data = await apiPost("/api/accounts/import", { filename: file.name, content });
     if (data && data.ok) {
-      applySettingsPayload(data);
+      applyAccountsPayload(data);
       toast("✓ " + data.message, "ok");
     }
   } catch (e) {
@@ -865,100 +889,259 @@ async function selectAccountFile(file) {
   }
 }
 
-async function clearAccount() {
-  const data = await apiPost("/api/account/clear", {});
+function accountStatusBadge(account) {
+  const map = {
+    pending: '<span class="badge">待执行</span>',
+    queued: '<span class="badge">排队中</span>',
+    running: '<span class="badge online">运行中</span>',
+    completed: '<span class="badge online">已完成</span>',
+    failed: '<span class="badge offline">失败·待续跑</span>',
+  };
+  const detail = account.last_error ? '<div class="muted">' + esc(account.last_error) + '</div>' : "";
+  return (map[account.status] || '<span class="badge">' + esc(account.status) + '</span>') + detail;
+}
+
+function deviceAssignmentOptions(account) {
+  const online = latestDevices.filter(d => d.state === "device");
+  const known = new Set(online.map(d => d.serial));
+  let options = '<option value="">自动分配到已勾选设备</option>';
+  options += online.map(d => {
+    const label = (d.model || d.brand || d.serial) + " · " + d.serial;
+    return '<option value="' + esc(d.serial) + '"' + (account.assigned_device === d.serial ? " selected" : "") + '>' + esc(label) + '</option>';
+  }).join("");
+  if (account.assigned_device && !known.has(account.assigned_device)) {
+    options += '<option value="' + esc(account.assigned_device) + '" selected>' + esc(account.assigned_device) + '（当前离线）</option>';
+  }
+  return options;
+}
+
+function renderAccounts() {
+  const body = document.getElementById("accountsBody");
+  if (!body) return;
+  const summary = document.getElementById("accountSummary");
+  if (!accountQueue.length) {
+    body.innerHTML = '<tr><td class="account-empty" colspan="6">请选择账号文本文件</td></tr>';
+    summary.textContent = "尚未导入账号";
+    updateRunControls();
+    return;
+  }
+  summary.textContent = (accountSourceFilename ? accountSourceFilename + " · " : "") +
+    "共 " + accountSummary.total + " 个，已勾选 " + accountSummary.selected +
+    " 个，已完成 " + accountSummary.completed + " 个，失败待续跑 " + accountSummary.failed + " 个";
+  body.innerHTML = accountQueue.map(account => {
+    const locked = ["queued", "running", "completed"].includes(account.status);
+    const rowClass = account.status === "completed" ? "account-completed" :
+      (["queued", "running"].includes(account.status) ? "account-running" : "");
+    return '<tr class="' + rowClass + '">' +
+      '<td>' + account.position + '</td>' +
+      '<td><input type="checkbox" data-account-check="' + esc(account.id) + '"' +
+        (account.selected ? " checked" : "") + (locked ? " disabled" : "") + ' aria-label="执行账号 ' + esc(account.phone) + '"></td>' +
+      '<td><b>' + esc(account.phone) + '</b><div class="muted">' + esc(account.country || "auto") + '</div></td>' +
+      '<td><select class="account-device-select" data-account-device="' + esc(account.id) + '"' + (locked ? " disabled" : "") + '>' +
+        deviceAssignmentOptions(account) + '</select></td>' +
+      '<td>' + accountStatusBadge(account) + '</td>' +
+      '<td>' + esc(account.last_device || "-") + '</td>' +
+      '</tr>';
+  }).join("");
+  updateRunControls();
+}
+
+function applyAccountsPayload(payload) {
+  if (!payload) return;
+  accountQueue = payload.accounts || [];
+  accountSummary = payload.summary || { total: accountQueue.length, selected: 0, completed: 0, failed: 0 };
+  accountSourceFilename = payload.source_filename || accountSourceFilename;
+  renderAccounts();
+}
+
+async function loadAccounts(silent = false) {
+  try {
+    const res = await fetch("/api/accounts", { cache: "no-store" });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.message || "读取账号列表失败");
+    applyAccountsPayload(data);
+  } catch (e) {
+    if (!silent) toast("读取账号列表失败：" + e.message, "err");
+  }
+}
+
+async function updateAccount(id, changes) {
+  const data = await apiPost("/api/accounts/update", Object.assign({ id }, changes));
+  if (data && data.ok) applyAccountsPayload(data);
+}
+
+async function selectAllAccounts(selected) {
+  const data = await apiPost("/api/accounts/select-all", { selected });
+  if (data && data.ok) applyAccountsPayload(data);
+}
+
+async function clearAccounts() {
+  if (!window.confirm("确定清空账号列表和本地执行进度吗？此操作无法撤销。")) return;
+  const data = await apiPost("/api/accounts/clear", {});
   if (data && data.ok) {
-    renderAccount(null);
+    accountSourceFilename = "";
+    applyAccountsPayload(data);
     toast("✓ " + data.message, "ok");
   }
 }
 
 // ---------- 自动化任务 ----------
-let taskId = null;
-let taskOffset = 0;
 let taskTimer = null;
+let taskStates = [];
+let activeLogSerial = null;
+let lastAccountPollAt = 0;
+const logOffsets = new Map();
+const logBuffers = new Map();
+const logTaskIds = new Map();
 
 async function runTask() {
-  const serial = document.getElementById("taskDevice").value;
-  if (!serial) { toast("请选择在线设备", "err"); return; }
+  const serials = [...selectedDevices];
+  if (!serials.length) { toast("请至少勾选一台在线设备", "err"); return; }
+  if (!accountQueue.some(account => account.selected && account.status !== "completed")) {
+    toast("请至少勾选一个未完成账号", "err");
+    return;
+  }
   const btn = document.getElementById("btnRunTask");
   btn.disabled = true;
   try {
     const res = await fetch("/api/task/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ serial })
+      body: JSON.stringify({ serials })
     });
     const data = await res.json();
     toast((data.ok ? "✓ " : "✗ ") + data.message, data.ok ? "ok" : "err");
     if (data.ok) {
-      taskId = data.id;
-      taskOffset = 0;
-      document.getElementById("taskLog").textContent = "";
-      setTaskStatus("running", "", serial);
-      pollTask();
+      (data.serials || []).forEach(serial => {
+        logOffsets.set(serial, 0);
+        logBuffers.set(serial, "");
+        logTaskIds.delete(serial);
+      });
+      activeLogSerial = (data.serials || [])[0] || activeLogSerial;
+      pollTasks();
     } else {
-      btn.disabled = false;
+      updateRunControls();
     }
   } catch (e) {
     toast("启动失败：" + e.message, "err");
-    btn.disabled = false;
+    updateRunControls();
   }
 }
 
-async function pollTask() {
-  try {
-    const res = await fetch("/api/task?offset=" + taskOffset);
-    const data = await res.json();
-    if (!data.task) {
-      if (taskId) { taskId = null; setTaskStatus(null); }
-      return;
-    }
-    const t = data.task;
-    if (t.id !== taskId) { taskId = t.id; taskOffset = 0; }
-    if (t.lines.length) {
-      const box = document.getElementById("taskLog");
-      box.textContent += t.lines.map(l => l + "\n").join("");
-      box.scrollTop = box.scrollHeight;
-      taskOffset = t.total;
-    }
-    if (t.status === "running") {
-      setTaskStatus("running", t.started, t.serial);
-      taskTimer = setTimeout(pollTask, 1000);
-    } else {
-      setTaskStatus(t.status, t.started, t.serial);
-      taskId = null;
-    }
-  } catch (e) {
-    taskTimer = setTimeout(pollTask, 2000);
-  }
+function taskStatusBadge(status) {
+  const map = {
+    running: '<span class="badge online">运行中</span>',
+    success: '<span class="badge online">全部完成</span>',
+    partial: '<span class="badge offline">部分失败</span>',
+    stopped: '<span class="badge offline">已停止</span>',
+  };
+  return map[status] || '<span class="badge">' + esc(status || "空闲") + '</span>';
 }
 
-function setTaskStatus(status, started, serial) {
-  const el = document.getElementById("taskStatus");
-  const runBtn = document.getElementById("btnRunTask");
-  const stopBtn = document.getElementById("btnStopTask");
-  const hasDevice = !!document.getElementById("taskDevice").value;
-  if (!status) {
-    el.innerHTML = '<span class="badge">空闲</span>';
-    runBtn.disabled = !hasDevice;
-    stopBtn.disabled = true;
+function renderTaskOverview() {
+  const tabs = document.getElementById("logTabs");
+  if (!taskStates.length) {
+    tabs.innerHTML = '<span class="muted">启动任务后，每台设备会在这里显示独立日志</span>';
+    document.getElementById("taskStatus").innerHTML = '<span class="badge">空闲</span>';
+    document.getElementById("btnClearLog").disabled = true;
+    updateRunControls();
     return;
   }
-  const map = {
-    running: ['<span class="badge online">运行中</span>', true, false],
-    success: ['<span class="badge online">成功</span>', false, true],
-    error: ['<span class="badge offline">失败</span>', false, true],
-  };
-  const m = map[status] || ['<span class="badge">' + esc(status) + "</span>", false, true];
-  el.innerHTML = m[0] + (started ? " 启动于 " + esc(started) : "") + (serial ? " · " + esc(serial) : "");
-  runBtn.disabled = m[1] || !hasDevice;
-  stopBtn.disabled = m[2];
+  if (!activeLogSerial || !taskStates.some(task => task.serial === activeLogSerial)) {
+    activeLogSerial = taskStates[0].serial;
+  }
+  tabs.innerHTML = taskStates.map(task => {
+    const active = task.serial === activeLogSerial ? " active" : "";
+    const running = task.status === "running" ? " running" : "";
+    return '<button class="log-tab' + active + running + '" data-log-serial="' + esc(task.serial) + '">' +
+      esc(task.serial) + ' · ' + task.progress + '/' + task.total + '</button>';
+  }).join("");
+  renderActiveTaskStatus();
+  updateRunControls();
+}
+
+function renderActiveTaskStatus() {
+  const task = taskStates.find(item => item.serial === activeLogSerial);
+  const status = document.getElementById("taskStatus");
+  document.getElementById("btnClearLog").disabled = !activeLogSerial;
+  if (!task) {
+    status.innerHTML = '<span class="badge">空闲</span>';
+    return;
+  }
+  status.innerHTML = taskStatusBadge(task.status) + " · 设备 " + esc(task.serial) +
+    (task.current_phone ? " · 当前账号 " + esc(task.current_phone) : "") +
+    " · 进度 " + task.progress + "/" + task.total +
+    " · 完成 " + task.completed + " · 失败 " + task.failures;
+}
+
+async function fetchActiveDeviceLog() {
+  if (!activeLogSerial) return;
+  const serial = activeLogSerial;
+  const offset = logOffsets.get(serial) || 0;
+  try {
+    const res = await fetch("/api/task?serial=" + encodeURIComponent(serial) + "&offset=" + offset, { cache: "no-store" });
+    const data = await res.json();
+    if (!data.task) return;
+    const t = data.task;
+    if (logTaskIds.get(serial) !== t.id) {
+      logTaskIds.set(serial, t.id);
+      logOffsets.set(serial, 0);
+      logBuffers.set(serial, "");
+    }
+    if (t.reset) logBuffers.set(serial, "");
+    if (t.lines.length) {
+      const next = (logBuffers.get(serial) || "") + t.lines.map(line => line + "\n").join("");
+      logBuffers.set(serial, next);
+    }
+    logOffsets.set(serial, t.line_total);
+    if (activeLogSerial === serial) {
+      const box = document.getElementById("taskLog");
+      box.textContent = logBuffers.get(serial) || "暂无日志…";
+      box.scrollTop = box.scrollHeight;
+    }
+  } catch (_) {
+  }
+}
+
+async function pollTasks() {
+  clearTimeout(taskTimer);
+  try {
+    const res = await fetch("/api/task", { cache: "no-store" });
+    const data = await res.json();
+    taskStates = data.tasks || [];
+    renderTaskOverview();
+    const jobs = [fetchActiveDeviceLog()];
+    if (Date.now() - lastAccountPollAt >= 1800) {
+      lastAccountPollAt = Date.now();
+      jobs.push(loadAccounts(true));
+    }
+    await Promise.all(jobs);
+  } catch (_) {
+  }
+  const active = taskStates.some(task => task.status === "running");
+  taskTimer = setTimeout(pollTasks, active ? 800 : 2000);
+}
+
+function updateRunControls() {
+  const runBtn = document.getElementById("btnRunTask");
+  const stopBtn = document.getElementById("btnStopTask");
+  const runnableAccounts = accountQueue.some(account => account.selected && !["completed", "queued", "running"].includes(account.status));
+  const running = taskStates.some(task => task.status === "running");
+  runBtn.disabled = !selectedDevices.size || !runnableAccounts;
+  stopBtn.disabled = !running;
+  const online = latestDevices.filter(device => device.state === "device");
+  document.getElementById("btnSelectOnlineDevices").textContent =
+    online.length && online.every(device => selectedDevices.has(device.serial)) ?
+      "取消勾选全部设备" : "勾选全部在线设备";
+  document.getElementById("selectedDeviceSummary").textContent = selectedDevices.size ?
+    "已勾选 " + selectedDevices.size + " 台设备；自动账号将均衡分配" : "未勾选设备";
 }
 
 async function stopTask() {
   try {
-    const res = await fetch("/api/task/stop", { method: "POST" });
+    const res = await fetch("/api/task/stop", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}"
+    });
     const data = await res.json();
     toast((data.ok ? "✓ " : "✗ ") + data.message, data.ok ? "ok" : "err");
   } catch (e) {
@@ -967,8 +1150,14 @@ async function stopTask() {
 }
 
 function clearLog() {
-  document.getElementById("taskLog").textContent = "";
-  taskOffset = 0;
+  if (!activeLogSerial) return;
+  apiPost("/api/task/log/clear", { serial: activeLogSerial }).then(data => {
+    if (!data || !data.ok) return;
+    logOffsets.set(activeLogSerial, 0);
+    logBuffers.set(activeLogSerial, "");
+    document.getElementById("taskLog").textContent = "暂无日志…";
+    toast("✓ " + data.message, "ok");
+  });
 }
 
 // ---------- 提示 ----------
@@ -997,9 +1186,17 @@ document.getElementById("taskCountry").addEventListener("change", saveCountry);
 document.getElementById("btnChooseAccount").addEventListener("click", () => {
   document.getElementById("accountFile").click();
 });
-document.getElementById("btnClearAccount").addEventListener("click", clearAccount);
+document.getElementById("btnSelectAllAccounts").addEventListener("click", () => selectAllAccounts(true));
+document.getElementById("btnUnselectAllAccounts").addEventListener("click", () => selectAllAccounts(false));
+document.getElementById("btnClearAccounts").addEventListener("click", clearAccounts);
 document.getElementById("accountFile").addEventListener("change", e => {
   selectAccountFile(e.target.files && e.target.files[0]);
+});
+document.getElementById("accountsBody").addEventListener("change", e => {
+  const checkbox = e.target.closest("[data-account-check]");
+  if (checkbox) updateAccount(checkbox.dataset.accountCheck, { selected: checkbox.checked });
+  const select = e.target.closest("[data-account-device]");
+  if (select) updateAccount(select.dataset.accountDevice, { assigned_device: select.value });
 });
 document.querySelectorAll("[data-toggle-secret]").forEach(btn => {
   btn.addEventListener("click", () => {
@@ -1015,6 +1212,21 @@ ipInput.addEventListener("keydown", e => { if (e.key === "Enter") doConnect(); }
 document.getElementById("btnRunTask").addEventListener("click", runTask);
 document.getElementById("btnStopTask").addEventListener("click", stopTask);
 document.getElementById("btnClearLog").addEventListener("click", clearLog);
+document.getElementById("btnSelectOnlineDevices").addEventListener("click", () => {
+  const online = latestDevices.filter(device => device.state === "device");
+  const allSelected = online.length && online.every(device => selectedDevices.has(device.serial));
+  online.forEach(device => allSelected ? selectedDevices.delete(device.serial) : selectedDevices.add(device.serial));
+  render(latestDevices);
+  updateRunControls();
+});
+document.getElementById("logTabs").addEventListener("click", e => {
+  const tab = e.target.closest("[data-log-serial]");
+  if (!tab) return;
+  activeLogSerial = tab.dataset.logSerial;
+  document.getElementById("taskLog").textContent = logBuffers.get(activeLogSerial) || "正在读取日志…";
+  renderTaskOverview();
+  fetchActiveDeviceLog();
+});
 
 // 设备卡片按钮（事件委托，避免 onclick 内嵌序列号导致的引号问题）
 grid.addEventListener("click", e => {
@@ -1022,11 +1234,30 @@ grid.addEventListener("click", e => {
   if (!btn) return;
   const act = btn.dataset.act;
   const serial = btn.dataset.serial;
-  if (act === "preview") openPreview(serial);
+  if (act === "log") {
+    activeLogSerial = serial;
+    if (!taskStates.some(task => task.serial === serial)) {
+      toast("该设备还没有任务日志", "err");
+      return;
+    }
+    document.getElementById("taskLog").textContent = logBuffers.get(serial) || "正在读取日志…";
+    renderTaskOverview();
+    fetchActiveDeviceLog();
+    document.getElementById("taskLog").scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+  else if (act === "preview") openPreview(serial);
   else if (act === "shot") showScreenshot(serial);
   else if (act === "tcpip") doTcpip(serial);
   else if (act === "wifi") connectAddress(btn.dataset.ip + ":5555");
   else if (act === "disc") doDisconnect(serial);
+});
+grid.addEventListener("change", e => {
+  const checkbox = e.target.closest("[data-device-check]");
+  if (!checkbox) return;
+  if (checkbox.checked) selectedDevices.add(checkbox.dataset.deviceCheck);
+  else selectedDevices.delete(checkbox.dataset.deviceCheck);
+  render(latestDevices);
+  updateRunControls();
 });
 
 setInterval(() => {
@@ -1035,6 +1266,8 @@ setInterval(() => {
 
 loadDevices();
 loadAutomationSettings();
+loadAccounts();
+pollTasks();
 </script>
 </body>
 </html>

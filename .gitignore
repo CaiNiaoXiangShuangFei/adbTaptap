@@ -18,3 +18,5 @@ taptap_log_*.log
 # 本地账号与 Token 设置（包含敏感信息）
 adb_manager/settings.json
 adb_manager/accounts/
+adb_manager/account_queue.json
+adb_manager/device_logs/
