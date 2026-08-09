@@ -1078,6 +1078,49 @@ def is_search_page(elements) -> bool:
         or any("EditText" in (elem.class_name or "") for elem in elements)
 
 
+def _game_search_input_is_empty(elements) -> bool:
+    input_elem = _find_element_by_id_candidates(elements, ["input_box"])
+    return input_elem is not None and not (input_elem.text or "").strip()
+
+
+def input_game_search_text(elements, game_name: str) -> bool:
+    """清除搜索框的历史词并输入游戏名，最终从 input_box 读回确认。"""
+    for attempt in range(1, 3):
+        current_elements = elements if attempt == 1 else get_ui_elements_safe(DEVICE_ID)
+        input_elem = _find_element_by_id_candidates(current_elements, ["input_box"])
+        if input_elem is None:
+            inputs = find_text_input_elements(current_elements)
+            input_elem = inputs[0] if inputs else None
+        if input_elem is None:
+            print("    [FAIL] 搜索页面未找到游戏名输入框")
+            return False
+        if _input_text_is_present(current_elements, game_name):
+            return True
+
+        cleared = not bool((input_elem.text or "").strip())
+        clear_button = _find_element_by_id_candidates(current_elements, ["clear_input"])
+        if clear_button is not None:
+            print(f"    [ACTION] 清除历史搜索词: {input_elem.text or '-'}")
+            _tap_elem(clear_button, "清除历史搜索词")
+            cleared_elements = wait_for_ui_condition(
+                _game_search_input_is_empty,
+                timeout=1.5,
+            )
+            cleared = cleared_elements is not None
+            if cleared_elements:
+                current_elements = cleared_elements
+                input_elem = _find_element_by_id_candidates(current_elements, ["input_box"])
+
+        if not cleared:
+            print("    [WARN] 清除按钮未确认生效，使用输入法清空后覆盖...")
+        if input_text_verified(input_elem, game_name, clear=not cleared):
+            print(f"    [OK] 游戏名已输入并验证: {game_name}")
+            return True
+        if attempt < 2:
+            print("    [WARN] 游戏名未能读回确认，重新清空并输入...")
+    return False
+
+
 def is_game_detail_page(elements, game_name: str | None = None) -> bool:
     action_texts = ("下载", "安装", "启动", "打开")
     screen_bottom = max((elem.rect[3] for elem in elements), default=0)
@@ -1411,8 +1454,7 @@ def run_qq_game_download_flow() -> bool:
         print("    [FAIL] 点击搜索入口后未进入搜索页面")
         return False
     search_elements = log_global_ui_elements("QQ-5 输入游戏名前") or search_elements
-    inputs = find_text_input_elements(search_elements)
-    if not inputs or not input_text_verified(inputs[0], GAME_NAME):
+    if not input_game_search_text(search_elements, GAME_NAME):
         print("    [FAIL] 游戏名输入失败")
         return False
     search_button = _clickable_target_for_text(
@@ -2712,14 +2754,8 @@ def main():
     #     restore_keyboard(original_ime, DEVICE_ID)
     #     print("    [OK] 已输入搜索词")
     # else:
-    inputs = find_text_input_elements(elements)
-    if inputs:
-        if not input_text_verified(inputs[0], GAME_NAME):
-            print("    [FAIL] 搜索词输入后无法从输入框读回验证")
-            return
-        print(f"    [OK] 搜索词已输入并验证: {GAME_NAME}")
-    else:
-        print("    [FAIL] 无法输入搜索词")
+    if not input_game_search_text(elements, GAME_NAME):
+        print("    [FAIL] 搜索词输入后无法从输入框读回验证")
         return
 
     time.sleep(CLICK_SETTLE_DELAY)
