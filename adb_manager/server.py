@@ -968,20 +968,28 @@ def _run_qq_device_task_once(task: dict, settings: dict) -> bool:
 
 
 def _run_qq_device_task(task: dict, settings: dict) -> None:
-    """持续执行 QQ 全流程；每轮完成后立即启动下一轮，直到用户停止。"""
+    """持续执行 QQ 全流程，直到完成设备配额或用户停止。"""
+    target_cycles = int(task.get("total") or 0)
     completed_cycles = 0
     failed_cycles = 0
-    cycle = 0
+    attempt = 0
     _append_task_line(task, "=" * 60)
-    _append_task_line(task, f"[系统] QQ 循环任务启动: {task['serial']} | 将持续运行直到手动停止")
+    _append_task_line(
+        task,
+        f"[系统] QQ 循环任务启动: {task['serial']} | 目标完成 {target_cycles} 次",
+    )
 
-    while not task["stop_event"].is_set():
-        cycle += 1
+    while completed_cycles < target_cycles and not task["stop_event"].is_set():
+        attempt += 1
+        current_cycle = completed_cycles + 1
         with _TASK_LOCK:
             task["status"] = "running"
-            task["progress"] = cycle
-            task["current_phone"] = f"QQ 第 {cycle} 轮"
-        _append_task_line(task, f"[系统] 开始 QQ 全流程第 {cycle} 轮")
+            task["progress"] = completed_cycles
+            task["current_phone"] = f"QQ 第 {current_cycle}/{target_cycles} 次"
+        _append_task_line(
+            task,
+            f"[系统] 开始 QQ 全流程第 {current_cycle}/{target_cycles} 次（尝试 {attempt}）",
+        )
 
         cycle_succeeded = _run_qq_device_task_once(task, settings)
         stopped = task["stop_event"].is_set()
@@ -991,17 +999,17 @@ def _run_qq_device_task(task: dict, settings: dict) -> None:
             completed_cycles += 1
             _append_task_line(
                 task,
-                f"[系统] QQ 第 {cycle} 轮完成，即将清除 TapTap 数据并开始下一轮",
+                f"[系统] QQ 已完成 {completed_cycles}/{target_cycles} 次",
             )
         elif not stopped:
             failed_cycles += 1
             _append_task_line(
                 task,
-                f"[系统] QQ 第 {cycle} 轮失败，2 秒后重新清除数据并重试",
+                f"[系统] QQ 第 {current_cycle}/{target_cycles} 次失败，2 秒后重新清除数据并重试（失败不计完成次数）",
             )
 
         with _TASK_LOCK:
-            task["progress"] = cycle
+            task["progress"] = completed_cycles
             task["completed"] = completed_cycles
             task["failures"] = failed_cycles
             task["current_phone"] = ""
@@ -1012,19 +1020,29 @@ def _run_qq_device_task(task: dict, settings: dict) -> None:
         if not cycle_succeeded and task["stop_event"].wait(2.0):
             break
 
+    stopped = task["stop_event"].is_set()
     with _TASK_LOCK:
         task["current_phone"] = ""
+        task["progress"] = completed_cycles
         task["completed"] = completed_cycles
         task["failures"] = failed_cycles
-        task["status"] = "stopped"
+        task["status"] = "stopped" if stopped else "success"
     _append_task_line(
         task,
-        f"[系统] QQ 循环任务已停止: 完成 {completed_cycles} 轮，失败 {failed_cycles} 轮",
+        (
+            f"[系统] QQ 循环任务已停止: 完成 {completed_cycles}/{target_cycles} 次，失败 {failed_cycles} 次"
+            if stopped else
+            f"[系统] QQ 循环任务全部完成: {completed_cycles}/{target_cycles} 次，失败重试 {failed_cycles} 次"
+        ),
     )
     _append_task_line(task, "=" * 60)
 
 
-def _start_qq_device_tasks(requested: list[str], settings: dict) -> dict:
+def _start_qq_device_tasks(
+    requested: list[str],
+    settings: dict,
+    execution_counts: dict[str, int],
+) -> dict:
     with _TASK_LOCK:
         busy = [
             serial for serial in requested
@@ -1049,7 +1067,7 @@ def _start_qq_device_tasks(requested: list[str], settings: dict) -> dict:
                 "current_account_id": None,
                 "current_phone": "",
                 "progress": 0,
-                "total": "∞",
+                "total": execution_counts[serial],
                 "completed": 0,
                 "failures": 0,
                 "account_ids": [],
@@ -1069,8 +1087,50 @@ def _start_qq_device_tasks(requested: list[str], settings: dict) -> dict:
         "ok": True,
         "batch_id": batch_id,
         "serials": list(requested),
-        "message": f"已在 {len(requested)} 台设备启动 QQ 号循环全流程（手动停止前持续运行）",
+        "message": (
+            f"已在 {len(requested)} 台设备启动 QQ 号全流程，"
+            f"总执行 {sum(execution_counts.values())} 次"
+        ),
     }
+
+
+def _normalize_execution_counts(
+    requested: list[str],
+    device_counts,
+    total_count,
+) -> tuple[dict[str, int] | None, str]:
+    """校验并标准化每台设备的执行配额；未传入时兼容为每台 1 次。"""
+    raw_counts = device_counts if isinstance(device_counts, dict) else {}
+    counts = {}
+    for serial in requested:
+        raw_value = raw_counts.get(serial, 1)
+        if isinstance(raw_value, bool):
+            return None, f"设备 {serial} 的执行数量无效"
+        if isinstance(raw_value, float) and not raw_value.is_integer():
+            return None, f"设备 {serial} 的执行数量必须是整数"
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            return None, f"设备 {serial} 的执行数量必须是整数"
+        if value < 1 or value > 10000:
+            return None, f"设备 {serial} 的执行数量必须在 1 到 10000 之间"
+        counts[serial] = value
+
+    calculated_total = sum(counts.values())
+    if calculated_total > 100000:
+        return None, "总执行数量不能超过 100000"
+    if total_count not in (None, ""):
+        if isinstance(total_count, bool):
+            return None, "总执行数量无效"
+        if isinstance(total_count, float) and not total_count.is_integer():
+            return None, "总执行数量必须是整数"
+        try:
+            expected_total = int(total_count)
+        except (TypeError, ValueError):
+            return None, "总执行数量必须是整数"
+        if expected_total != calculated_total:
+            return None, f"设备执行数量之和为 {calculated_total}，与总执行数量 {expected_total} 不一致"
+    return counts, ""
 
 
 def api_task_run(
@@ -1078,8 +1138,10 @@ def api_task_run(
     game_name: str,
     flow_type: str = "new_account",
     capture_result_screenshot: bool = False,
+    device_counts=None,
+    total_count=None,
 ) -> dict:
-    """启动所选流程：新号按账号队列运行，QQ 号按设备持续循环。"""
+    """启动所选流程，并按每台设备的执行配额运行。"""
     if not os.path.isfile(TAPTAP_SCRIPT):
         return {"ok": False, "message": f"找不到脚本: {TAPTAP_SCRIPT}"}
     game_name = str(game_name or "").strip()
@@ -1100,6 +1162,12 @@ def api_task_run(
     if not requested:
         return {"ok": False, "message": "请至少勾选一台在线设备"}
 
+    execution_counts, count_error = _normalize_execution_counts(
+        requested, device_counts, total_count,
+    )
+    if count_error:
+        return {"ok": False, "message": count_error}
+
     online = {item["serial"] for item in list_devices_raw() if item["state"] == "device"}
     unavailable = [serial for serial in requested if serial not in online]
     if unavailable:
@@ -1110,7 +1178,7 @@ def api_task_run(
     settings["flow_type"] = flow_type
     settings["capture_screenshot"] = capture_result_screenshot is True
     if flow_type == "qq":
-        return _start_qq_device_tasks(requested, settings)
+        return _start_qq_device_tasks(requested, settings, execution_counts)
     with _TASK_LOCK:
         busy = [
             serial for serial in requested
@@ -1131,7 +1199,45 @@ def api_task_run(
         ]
         if not candidates:
             return {"ok": False, "message": "没有已勾选且未完成的账号"}
-        missing_links = [record["phone"] for record in candidates if not record.get("sms_api_url")]
+        queues = {serial: [] for serial in requested}
+        skipped_assigned = []
+        automatic = []
+        for record in candidates:
+            assigned = record.get("assigned_device") or ""
+            if assigned:
+                if assigned in queues:
+                    if len(queues[assigned]) < execution_counts[assigned]:
+                        queues[assigned].append(record["id"])
+                else:
+                    skipped_assigned.append(record["phone"])
+            else:
+                automatic.append(record)
+        for record in automatic:
+            available = [
+                serial for serial in requested
+                if len(queues[serial]) < execution_counts[serial]
+            ]
+            if not available:
+                break
+            serial = min(available, key=lambda item: (len(queues[item]), requested.index(item)))
+            queues[serial].append(record["id"])
+
+        shortages = [
+            f"{serial} 需要 {execution_counts[serial]} 个、仅分配到 {len(queues[serial])} 个"
+            for serial in requested
+            if len(queues[serial]) < execution_counts[serial]
+        ]
+        if shortages:
+            return {
+                "ok": False,
+                "message": "可用账号不足：" + "；".join(shortages),
+            }
+
+        allocated_ids = {account_id for queue in queues.values() for account_id in queue}
+        missing_links = [
+            record["phone"] for record in candidates
+            if record["id"] in allocated_ids and not record.get("sms_api_url")
+        ]
         if missing_links:
             preview = "、".join(missing_links[:5])
             suffix = " 等" if len(missing_links) > 5 else ""
@@ -1140,29 +1246,11 @@ def api_task_run(
                 "message": f"账号 {preview}{suffix} 缺少验证码提取链接，请重新选择账号文本文件",
             }
 
-        queues = {serial: [] for serial in requested}
-        skipped_assigned = []
-        automatic = []
-        for record in candidates:
-            assigned = record.get("assigned_device") or ""
-            if assigned:
-                if assigned in queues:
-                    queues[assigned].append(record["id"])
-                else:
-                    skipped_assigned.append(record["phone"])
-            else:
-                automatic.append(record)
-        for record in automatic:
-            serial = min(requested, key=lambda item: (len(queues[item]), requested.index(item)))
-            queues[serial].append(record["id"])
-
         batch_id = f"batch_{int(time.time() * 1000)}"
         started = []
         threads = []
         for serial in requested:
             account_ids = queues[serial]
-            if not account_ids:
-                continue
             task = {
                 "id": f"{batch_id}_{hashlib.sha256(serial.encode('utf-8')).hexdigest()[:8]}",
                 "batch_id": batch_id,
@@ -1201,7 +1289,7 @@ def api_task_run(
         for thread in threads:
             thread.start()
 
-    message = f"已启动 {len(started)} 个设备线程，共分配 {sum(len(queues[s]) for s in started)} 个账号"
+    message = f"已启动 {len(started)} 个设备线程，总执行 {sum(len(queues[s]) for s in started)} 次"
     if skipped_assigned:
         message += f"；跳过 {len(skipped_assigned)} 个分配给其他设备的账号"
     return {"ok": True, "batch_id": batch_id, "serials": started, "message": message}
@@ -1419,6 +1507,8 @@ class Handler(BaseHTTPRequestHandler):
                 data.get("game_name", ""),
                 data.get("flow_type", "new_account"),
                 data.get("capture_screenshot") is True,
+                data.get("device_counts"),
+                data.get("total_count"),
             ))
         if path == "/api/task/stop":
             return self._send_json(api_task_stop(data.get("serials") or data.get("serial")))

@@ -64,7 +64,7 @@
     line-height: 1.6; white-space: pre-wrap; word-break: break-all; color: var(--text);
   }
   .task-config {
-    display: grid; grid-template-columns: minmax(240px, .8fr) minmax(360px, 1.5fr);
+    display: grid; grid-template-columns: minmax(240px, 1.2fr) minmax(220px, .8fr) minmax(180px, .65fr);
     gap: 12px; margin-bottom: 14px;
   }
   .config-field {
@@ -110,6 +110,16 @@
     border: 1px solid var(--line); border-radius: 9px; background: rgba(3,10,25,.2);
   }
   .device-flow-options label { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; cursor: pointer; }
+  .device-count-field {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 9px 10px; border: 1px solid var(--line); border-radius: 9px;
+    background: rgba(3,10,25,.2); color: var(--muted); font-size: 12px;
+  }
+  .device-count-field input {
+    width: 96px; min-width: 0; background: var(--card2); border: 1px solid var(--line);
+    color: var(--text); padding: 6px 8px; border-radius: 7px; font-size: 12px; outline: none;
+  }
+  .device-count-field input:focus { border-color: var(--blue); }
   .card.device-selected { border-color: var(--blue); box-shadow: 0 0 0 1px rgba(59, 130, 246, .2); }
   .settings-card {
     width: min(680px, 94vw); max-height: 88vh; overflow: auto; background: var(--card);
@@ -488,6 +498,11 @@
           <option value="Canada">加拿大 / 美国（+1，任一均可）</option>
         </select>
       </div>
+      <div class="config-field">
+        <label for="taskTotalCount">总执行数量</label>
+        <input class="settings-input" id="taskTotalCount" type="number" min="1" max="100000" step="1" value="1" inputmode="numeric">
+        <div class="settings-hint">自动等于所有已勾选设备的执行数量之和；修改总数时会平均分配到设备。</div>
+      </div>
       <div class="config-field full" id="accountFileConfig">
         <label>账号文本文件</label>
         <div class="account-row">
@@ -625,6 +640,49 @@ const deviceCount = document.getElementById("deviceCount");
 let latestDevices = [];
 const selectedDevices = new Set();
 const deviceFlowTypes = new Map();
+const deviceExecutionCounts = new Map();
+let executionQuantityMode = "devices";
+
+function normalizeExecutionCount(value) {
+  const count = Number.parseInt(value, 10);
+  return Number.isFinite(count) && count >= 1 ? Math.min(count, 10000) : 1;
+}
+
+function normalizeTotalCount(value) {
+  const count = Number.parseInt(value, 10);
+  return Number.isFinite(count) && count >= 1 ? Math.min(count, 100000) : 1;
+}
+
+function executionCountFor(serial) {
+  return normalizeExecutionCount(deviceExecutionCounts.get(serial) || 1);
+}
+
+function selectedExecutionTotal(serials = [...selectedDevices]) {
+  return serials.reduce((total, serial) => total + executionCountFor(serial), 0);
+}
+
+function syncTotalFromDevices() {
+  const input = document.getElementById("taskTotalCount");
+  if (selectedDevices.size) input.value = selectedExecutionTotal();
+  else if (executionQuantityMode !== "total") input.value = 1;
+}
+
+function distributeTotalAcrossSelected(value) {
+  const serials = [...selectedDevices];
+  if (!serials.length) {
+    document.getElementById("taskTotalCount").value = normalizeTotalCount(value);
+    return;
+  }
+  const maximumTotal = Math.min(100000, serials.length * 10000);
+  let total = Math.min(Math.max(normalizeTotalCount(value), serials.length), maximumTotal);
+  if (total < serials.length) total = serials.length;
+  const base = Math.floor(total / serials.length);
+  const remainder = total % serials.length;
+  serials.forEach((serial, index) => {
+    deviceExecutionCounts.set(serial, base + (index < remainder ? 1 : 0));
+  });
+  syncTotalFromDevices();
+}
 
 // ---------- 设备列表 ----------
 async function loadDevices() {
@@ -634,6 +692,7 @@ async function loadDevices() {
     latestDevices = data.devices || [];
     const onlineSerials = new Set(latestDevices.filter(d => d.state === "device").map(d => d.serial));
     [...selectedDevices].forEach(serial => { if (!onlineSerials.has(serial)) selectedDevices.delete(serial); });
+    syncTotalFromDevices();
     render(latestDevices);
     renderAccounts();
     updateFlowUI();
@@ -663,6 +722,7 @@ function cardHtml(d) {
   const online = d.state === "device";
   const selected = online && selectedDevices.has(d.serial);
   const flowType = deviceFlowTypes.get(d.serial) || "new_account";
+  const executionCount = executionCountFor(d.serial);
   const title = d.model || d.brand || "Android 设备";
   const rows = [];
   const addRow = (k, v) => { if (v) rows.push("<dt>" + k + "</dt><dd>" + esc(v) + "</dd>"); };
@@ -706,6 +766,10 @@ function cardHtml(d) {
         <label><input type="radio" name="flow-${esc(d.serial)}" data-device-flow="${esc(d.serial)}" value="new_account" ${flowType === "new_account" ? "checked" : ""} ${online ? "" : "disabled"}>新号全流程</label>
         <label><input type="radio" name="flow-${esc(d.serial)}" data-device-flow="${esc(d.serial)}" value="qq" ${flowType === "qq" ? "checked" : ""} ${online ? "" : "disabled"}>QQ号全流程</label>
       </div>
+      <label class="device-count-field">
+        <span>该设备执行数量</span>
+        <input type="number" min="1" max="10000" step="1" inputmode="numeric" data-device-count="${esc(d.serial)}" value="${executionCount}" ${online ? "" : "disabled"}>
+      </label>
       ${rows.length ? '<dl class="meta">' + rows.join("") + "</dl>" : ""}
       ${actions ? '<div class="actions">' + actions + "</div>" : ""}
     </div>`;
@@ -1263,12 +1327,22 @@ async function runTask() {
   const serials = [...selectedDevices];
   const gameName = document.getElementById("taskGameName").value.trim();
   const captureScreenshot = document.getElementById("taskCaptureScreenshot").checked;
+  const configuredTotal = normalizeTotalCount(document.getElementById("taskTotalCount").value);
+  const calculatedTotal = selectedExecutionTotal(serials);
   const newAccountSerials = serials.filter(serial => (deviceFlowTypes.get(serial) || "new_account") === "new_account");
   const qqSerials = serials.filter(serial => deviceFlowTypes.get(serial) === "qq");
+  const newAccountTotal = selectedExecutionTotal(newAccountSerials);
+  const runnableAccountCount = accountQueue.filter(
+    account => account.selected && !["completed", "queued", "running"].includes(account.status)
+  ).length;
   if (!serials.length) { toast("请至少勾选一台在线设备", "err"); return; }
   if (!gameName) { toast("请输入游戏名", "err"); return; }
-  if (newAccountSerials.length && !accountQueue.some(account => account.selected && account.status !== "completed")) {
-    toast("请至少勾选一个未完成账号", "err");
+  if (configuredTotal !== calculatedTotal) {
+    toast("设备执行数量之和必须等于总执行数量", "err");
+    return;
+  }
+  if (newAccountSerials.length && runnableAccountCount < newAccountTotal) {
+    toast("新号流程需要 " + newAccountTotal + " 个可用账号，当前只有 " + runnableAccountCount + " 个", "err");
     return;
   }
   const btn = document.getElementById("btnRunTask");
@@ -1276,6 +1350,10 @@ async function runTask() {
   try {
     const startFlow = async (flowSerials, flowType) => {
       if (!flowSerials.length) return null;
+      const deviceCounts = Object.fromEntries(
+        flowSerials.map(serial => [serial, executionCountFor(serial)])
+      );
+      const flowTotal = selectedExecutionTotal(flowSerials);
       const res = await fetch("/api/task/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1284,6 +1362,8 @@ async function runTask() {
           game_name: gameName,
           flow_type: flowType,
           capture_screenshot: captureScreenshot,
+          device_counts: deviceCounts,
+          total_count: flowTotal,
         })
       });
       return res.json();
@@ -1410,22 +1490,31 @@ async function pollTasks() {
 function updateRunControls() {
   const runBtn = document.getElementById("btnRunTask");
   const stopBtn = document.getElementById("btnStopTask");
-  const runnableAccounts = accountQueue.some(account => account.selected && !["completed", "queued", "running"].includes(account.status));
+  const runnableAccountCount = accountQueue.filter(
+    account => account.selected && !["completed", "queued", "running"].includes(account.status)
+  ).length;
   const running = taskStates.some(task => task.status === "running");
   const hasGameName = !!document.getElementById("taskGameName").value.trim();
-  const hasSelectedNewAccountDevice = [...selectedDevices].some(
+  const selectedSerials = [...selectedDevices];
+  const newAccountSerials = selectedSerials.filter(
     serial => (deviceFlowTypes.get(serial) || "new_account") === "new_account"
   );
-  runBtn.disabled = !selectedDevices.size || (hasSelectedNewAccountDevice && !runnableAccounts) || !hasGameName;
+  const newAccountTarget = selectedExecutionTotal(newAccountSerials);
+  const calculatedTotal = selectedExecutionTotal(selectedSerials);
+  const configuredTotal = normalizeTotalCount(document.getElementById("taskTotalCount").value);
+  const countsMatch = configuredTotal === calculatedTotal;
+  runBtn.disabled = !selectedDevices.size || !hasGameName || !countsMatch || runnableAccountCount < newAccountTarget;
   stopBtn.disabled = !running;
   const online = latestDevices.filter(device => device.state === "device");
   document.getElementById("btnSelectOnlineDevices").textContent =
     online.length && online.every(device => selectedDevices.has(device.serial)) ?
       "取消勾选全部设备" : "勾选全部在线设备";
-  const selectedNewCount = [...selectedDevices].filter(serial => (deviceFlowTypes.get(serial) || "new_account") === "new_account").length;
+  const selectedNewCount = newAccountSerials.length;
   const selectedQqCount = selectedDevices.size - selectedNewCount;
+  const qqTarget = calculatedTotal - newAccountTarget;
   document.getElementById("selectedDeviceSummary").textContent = selectedDevices.size ?
-    "已勾选 " + selectedDevices.size + " 台设备；新号 " + selectedNewCount + " 台，QQ " + selectedQqCount + " 台" : "未勾选设备";
+    "已勾选 " + selectedDevices.size + " 台设备；总执行 " + calculatedTotal + " 次（新号 " +
+    selectedNewCount + " 台 / " + newAccountTarget + " 次，QQ " + selectedQqCount + " 台 / " + qqTarget + " 次）" : "未勾选设备";
 }
 
 function updateFlowUI() {
@@ -1709,6 +1798,19 @@ document.getElementById("qrModal").addEventListener("click", e => {
 });
 document.getElementById("taskCountry").addEventListener("change", saveCountry);
 document.getElementById("taskGameName").addEventListener("input", updateRunControls);
+document.getElementById("taskTotalCount").addEventListener("input", updateRunControls);
+document.getElementById("taskTotalCount").addEventListener("change", e => {
+  const requested = normalizeTotalCount(e.target.value);
+  executionQuantityMode = "total";
+  if (selectedDevices.size && requested < selectedDevices.size) {
+    toast("总执行数量不能小于已勾选设备数，已自动调整", "err");
+  } else if (selectedDevices.size && requested > selectedDevices.size * 10000) {
+    toast("单台设备最多执行 10000 次，已自动调整总数", "err");
+  }
+  distributeTotalAcrossSelected(requested);
+  render(latestDevices);
+  updateRunControls();
+});
 document.getElementById("btnChooseAccount").addEventListener("click", () => {
   document.getElementById("accountFile").click();
 });
@@ -1741,7 +1843,16 @@ document.getElementById("btnClearLog").addEventListener("click", clearLog);
 document.getElementById("btnSelectOnlineDevices").addEventListener("click", () => {
   const online = latestDevices.filter(device => device.state === "device");
   const allSelected = online.length && online.every(device => selectedDevices.has(device.serial));
-  online.forEach(device => allSelected ? selectedDevices.delete(device.serial) : selectedDevices.add(device.serial));
+  const configuredTotal = normalizeTotalCount(document.getElementById("taskTotalCount").value);
+  online.forEach(device => {
+    if (allSelected) selectedDevices.delete(device.serial);
+    else {
+      selectedDevices.add(device.serial);
+      if (!deviceExecutionCounts.has(device.serial)) deviceExecutionCounts.set(device.serial, 1);
+    }
+  });
+  if (executionQuantityMode === "total" && selectedDevices.size) distributeTotalAcrossSelected(configuredTotal);
+  else syncTotalFromDevices();
   render(latestDevices);
   updateFlowUI();
 });
@@ -1779,6 +1890,17 @@ grid.addEventListener("click", e => {
   else if (act === "disc") doDisconnect(serial);
 });
 grid.addEventListener("change", e => {
+  const countInput = e.target.closest("[data-device-count]");
+  if (countInput) {
+    const serial = countInput.dataset.deviceCount;
+    const count = normalizeExecutionCount(countInput.value);
+    executionQuantityMode = "devices";
+    deviceExecutionCounts.set(serial, count);
+    countInput.value = count;
+    syncTotalFromDevices();
+    updateRunControls();
+    return;
+  }
   const flow = e.target.closest("[data-device-flow]");
   if (flow) {
     deviceFlowTypes.set(flow.dataset.deviceFlow, flow.value);
@@ -1787,8 +1909,16 @@ grid.addEventListener("change", e => {
   }
   const checkbox = e.target.closest("[data-device-check]");
   if (!checkbox) return;
-  if (checkbox.checked) selectedDevices.add(checkbox.dataset.deviceCheck);
+  const configuredTotal = normalizeTotalCount(document.getElementById("taskTotalCount").value);
+  if (checkbox.checked) {
+    selectedDevices.add(checkbox.dataset.deviceCheck);
+    if (!deviceExecutionCounts.has(checkbox.dataset.deviceCheck)) {
+      deviceExecutionCounts.set(checkbox.dataset.deviceCheck, 1);
+    }
+  }
   else selectedDevices.delete(checkbox.dataset.deviceCheck);
+  if (executionQuantityMode === "total" && selectedDevices.size) distributeTotalAcrossSelected(configuredTotal);
+  else syncTotalFromDevices();
   render(latestDevices);
   updateFlowUI();
 });
