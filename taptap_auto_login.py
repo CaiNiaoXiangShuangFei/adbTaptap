@@ -31,6 +31,12 @@ _LOG_FILE = None
 _LOG_LOCK = threading.Lock()
 _WORKFLOW_COMPLETED = False
 
+# 点击后的 UI 验证采用短轮询；网络、短信和下载等长耗时操作另行设置超时。
+CLICK_SETTLE_DELAY = 0.25
+CLICK_RETRY_DELAY = 0.4
+CLICK_VERIFY_TIMEOUT = 2.5
+CLICK_POLL_INTERVAL = 0.25
+
 def _init_log():
     global _LOG_FILE
     log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)))
@@ -593,9 +599,10 @@ def _phone_number_is_present(elements, phone_number: str) -> bool:
     return False
 
 
-def input_phone_number(phone_number: str) -> bool:
+def input_phone_number(phone_number: str, elements=None) -> bool:
     """输入手机号并通过 UI 层级确认；失败时切换到原生 input 命令。"""
-    elements = get_ui_elements_safe(DEVICE_ID)
+    if not elements:
+        elements = get_ui_elements_safe(DEVICE_ID)
     input_elem = _find_phone_input(elements)
     if not input_elem:
         print("    [FAIL] 未找到手机号输入框")
@@ -603,17 +610,17 @@ def input_phone_number(phone_number: str) -> bool:
 
     _log(f"      → 点击输入框: {_elem_desc(input_elem)}")
     _tap_elem(input_elem)
-    time.sleep(0.5)
+    time.sleep(CLICK_SETTLE_DELAY)
 
     # 首选项目原有的 ADB Keyboard 输入方式。
     original_ime = None
     try:
         original_ime = detect_and_set_adb_keyboard(DEVICE_ID)
-        time.sleep(0.4)
+        time.sleep(CLICK_SETTLE_DELAY)
         clear_text(DEVICE_ID)
-        time.sleep(0.2)
+        time.sleep(0.1)
         type_text(phone_number, DEVICE_ID)
-        time.sleep(0.8)
+        time.sleep(0.5)
     except Exception as exc:
         print(f"    [WARN] ADB Keyboard 输入失败: {exc}")
     finally:
@@ -629,13 +636,13 @@ def input_phone_number(phone_number: str) -> bool:
     # 数字内容可安全使用 Android 原生 input text，不依赖特定输入法。
     print("    [WARN] 未检测到手机号，改用 Android 原生输入重试...")
     _tap_elem(input_elem)
-    time.sleep(0.3)
+    time.sleep(CLICK_SETTLE_DELAY)
     try:
         clear_text(DEVICE_ID)
     except Exception:
         pass
     result = adb_cmd("shell", "input", "text", phone_number, timeout=8)
-    time.sleep(1)
+    time.sleep(0.5)
     if result.returncode == 0 and _phone_number_is_present(
         get_ui_elements_safe(DEVICE_ID), phone_number
     ):
@@ -644,7 +651,7 @@ def input_phone_number(phone_number: str) -> bool:
     # 最后逐个发送数字按键，规避部分 ROM 对 input text 的限制。
     print("    [WARN] 原生文本输入未生效，改用数字按键重试...")
     _tap_elem(input_elem)
-    time.sleep(0.3)
+    time.sleep(CLICK_SETTLE_DELAY)
     try:
         clear_text(DEVICE_ID)
     except Exception:
@@ -652,7 +659,7 @@ def input_phone_number(phone_number: str) -> bool:
     for digit in phone_number:
         if digit.isdigit():
             adb_cmd("shell", "input", "keyevent", str(7 + int(digit)), timeout=4)
-    time.sleep(1)
+    time.sleep(0.5)
     return _phone_number_is_present(get_ui_elements_safe(DEVICE_ID), phone_number)
 
 
@@ -729,7 +736,11 @@ def agreement_radio_is_checked(elements) -> bool:
     return radio is not None and bool(getattr(radio, "checked", False))
 
 
-def wait_for_ui_condition(predicate, timeout: float = 8, interval: float = 0.5):
+def wait_for_ui_condition(
+    predicate,
+    timeout: float = 5,
+    interval: float = CLICK_POLL_INTERVAL,
+):
     """轮询 UI，返回首个满足后置条件的元素列表，超时返回 None。"""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -759,7 +770,7 @@ def tap_and_verify_disappeared(
     elem,
     label: str,
     *,
-    timeout: float = 5,
+    timeout: float = CLICK_VERIFY_TIMEOUT,
     retries: int = 2,
 ) -> bool:
     """点击元素，并确认原元素从 UI 层级消失。"""
@@ -799,16 +810,16 @@ def _input_text_is_present(elements, expected: str) -> bool:
 def input_text_verified(input_elem, value: str, *, clear: bool = True) -> bool:
     """输入普通文本并从 UI 读回验证，不成功则返回 False。"""
     _tap_elem(input_elem)
-    time.sleep(0.4)
+    time.sleep(CLICK_SETTLE_DELAY)
     original_ime = None
     try:
         original_ime = detect_and_set_adb_keyboard(DEVICE_ID)
-        time.sleep(0.3)
+        time.sleep(CLICK_SETTLE_DELAY)
         if clear:
             clear_text(DEVICE_ID)
-            time.sleep(0.2)
+            time.sleep(0.1)
         type_text(value, DEVICE_ID)
-        time.sleep(0.8)
+        time.sleep(0.5)
     except Exception as exc:
         print(f"    [WARN] 文本输入命令失败: {exc}")
     finally:
@@ -830,7 +841,7 @@ def input_text_verified(input_elem, value: str, *, clear: bool = True) -> bool:
             except Exception:
                 pass
         result = adb_cmd("shell", "input", "text", value, timeout=8)
-        time.sleep(0.8)
+        time.sleep(0.5)
         if result.returncode == 0 and _input_text_is_present(
             get_ui_elements_safe(DEVICE_ID), value
         ):
@@ -948,7 +959,7 @@ def download_has_started(elements) -> bool:
 
 def find_and_tap_safe(text: str = None, desc: str = None, res_id: str = None,
                       class_name: str = None, clickable: bool = True,
-                      retries: int = 3, delay: float = 1.0) -> bool:
+                      retries: int = 3, delay: float = CLICK_SETTLE_DELAY) -> bool:
     """带重试的查找并点击（捕获 uiautomator 暂时失败）。"""
     for i in range(retries):
         try:
@@ -959,7 +970,7 @@ def find_and_tap_safe(text: str = None, desc: str = None, res_id: str = None,
             )
         except RuntimeError as e:
             if i < retries - 1:
-                time.sleep(2.0)
+                time.sleep(CLICK_RETRY_DELAY)
                 continue
             return False
         if elem:
@@ -968,22 +979,22 @@ def find_and_tap_safe(text: str = None, desc: str = None, res_id: str = None,
             time.sleep(delay)
             return True
         if i < retries - 1:
-            time.sleep(1.5)
+            time.sleep(CLICK_RETRY_DELAY)
     return False
 
 
-def wait_and_tap(text: str = None, desc: str = None, timeout: float = 8.0) -> bool:
+def wait_and_tap(text: str = None, desc: str = None, timeout: float = 4.0) -> bool:
     """等待元素出现并点击。"""
     if text:
         elem = wait_for_element(
             find_element_by_text,
-            timeout=timeout, check_interval=0.8,
+            timeout=timeout, check_interval=CLICK_POLL_INTERVAL,
             text=text, device_id=DEVICE_ID
         )
     elif desc:
         elem = wait_for_element(
             find_element_by_desc,
-            timeout=timeout, check_interval=0.8,
+            timeout=timeout, check_interval=CLICK_POLL_INTERVAL,
             desc=desc, device_id=DEVICE_ID
         )
     else:
@@ -991,7 +1002,7 @@ def wait_and_tap(text: str = None, desc: str = None, timeout: float = 8.0) -> bo
     if elem:
         print(f"      → 点击元素: {_elem_desc(elem)}")
         _tap_elem(elem)
-        time.sleep(1)
+        time.sleep(CLICK_SETTLE_DELAY)
         return True
     return False
 
@@ -999,7 +1010,7 @@ def wait_and_tap(text: str = None, desc: str = None, timeout: float = 8.0) -> bo
 def scroll_down_in_list(steps: int = 3) -> None:
     """在列表中向下滑动（用于选择国家/地区）。"""
     adb_cmd("shell", "input", "swipe", "500", "1500", "500", "500", "300")
-    time.sleep(1)
+    time.sleep(CLICK_RETRY_DELAY)
 
 
 def _swipe_slider(x1: int, y1: int, x2: int, y2: int) -> None:
@@ -1130,11 +1141,11 @@ def verify_captcha_with_jfbym() -> bool:
             reload_btn = find_element_by_id("reload", elems_now)
             if reload_btn:
                 _tap_elem(reload_btn)
-                time.sleep(1.5)
+                time.sleep(0.5)
             else:
                 # 备用：点击验证码图片区域触发刷新
                 tap((img_x1 + img_x2) // 2, (img_y1 + img_y2) // 2, DEVICE_ID)
-                time.sleep(1.5)
+                time.sleep(0.5)
             # 重新获取 captcha_elem
             fresh_elems = get_ui_elements_safe(DEVICE_ID)
             fresh_captcha = find_captcha_image(fresh_elems, DEVICE_ID)
@@ -1189,7 +1200,7 @@ def verify_captcha_with_jfbym() -> bool:
                 print(f"    点击 ({screen_x}, {screen_y}) <- 相对({rel_x},{rel_y}) + 图片({img_x1},{img_y1})")
 
                 _tap_xy(screen_x, screen_y)
-                time.sleep(2)
+                time.sleep(0.75)
 
                 # 检查验证码是否消失
                 elems_after = get_ui_elements_safe(DEVICE_ID)
@@ -1396,7 +1407,7 @@ def main():
 
     # ---- 第 3 步：隐私政策和权限弹窗 ----
     _log("\n[3] 处理初始化弹窗（隐私政策 + 权限）...")
-    log_global_ui_elements("3 处理初始化弹窗前")
+    init_elements = log_global_ui_elements("3 处理初始化弹窗前")
 
     handled = {"privacy": False}
     idle_rounds = 0
@@ -1405,9 +1416,13 @@ def main():
     for init_attempt in range(20):
         # 每轮只 dump 一次，所有查找共享
         try:
-            elements = get_ui_elements_safe(DEVICE_ID)
+            elements = (
+                init_elements
+                if init_attempt == 0 and init_elements
+                else get_ui_elements_safe(DEVICE_ID)
+            )
         except RuntimeError:
-            time.sleep(2)
+            time.sleep(CLICK_RETRY_DELAY)
             continue
         clicked = False
 
@@ -1470,14 +1485,14 @@ def main():
 
         if clicked:
             idle_rounds = 0
-            time.sleep(1.2)
+            time.sleep(CLICK_RETRY_DELAY)
             continue
 
         idle_rounds += 1
         if idle_rounds >= 2:
             print(f"    - 弹窗处理完毕（连续 {idle_rounds} 轮无更多弹窗）")
             break
-        time.sleep(0.8)
+        time.sleep(CLICK_SETTLE_DELAY)
     else:
         print("    [FAIL] 达到最大处理轮数，初始化弹窗仍未确认处理完毕")
         return
@@ -1488,30 +1503,32 @@ def main():
         return
     print("    [OK] 第 3 步验证通过：初始化弹窗均已处理")
 
-    time.sleep(1)
+    time.sleep(CLICK_SETTLE_DELAY)
 
     # ---- 第 5 步：返回主页，点击头像进入登录 ----
     _log("\n[5] 导航到登录页...")
-    log_global_ui_elements("5 导航到登录页前")
+    home_elems = (
+        log_global_ui_elements("5 导航到登录页前")
+        or get_ui_elements_safe(DEVICE_ID)
+    )
 
     # 检查是否在主页：查找底部导航栏 tb_layout_home_bottom_bar
-    home_elems = get_ui_elements_safe(DEVICE_ID)
     home_tab = find_element_by_id("com.taptap:id/tb_layout_home_bottom_bar", home_elems)
     if not home_tab:
         print("    [WARN] 不在主页，按返回键回到主页...")
         back(DEVICE_ID)
-        if wait_for_ui_condition(is_home_page, timeout=5) is None:
+        if wait_for_ui_condition(is_home_page, timeout=3) is None:
             print("    [WARN] 返回后仍未确认主页，继续尝试定位头像")
     else:
         print("    [OK] 已在主页")
 
     # 循环：弹窗检测 + 头像查找合并在一起，失败自动重试
     avatar_found = False
-    for attempt in range(12):
+    for attempt in range(6):
         try:
             elems = get_ui_elements_safe(DEVICE_ID)
         except RuntimeError:
-            time.sleep(1)
+            time.sleep(CLICK_RETRY_DELAY)
             continue
 
         # 1) 检查是否有弹窗挡住（更新弹窗、评分弹窗等）
@@ -1524,7 +1541,7 @@ def main():
         if dismiss:
             print(f"    发现弹窗: {_elem_desc(dismiss)}")
             _tap_elem(dismiss)
-            time.sleep(0.5)
+            time.sleep(CLICK_SETTLE_DELAY)
             continue
 
         cancel = find_with_multiple_conditions(
@@ -1534,7 +1551,7 @@ def main():
         if cancel:
             print(f"    发现弹窗: {_elem_desc(cancel)}")
             _tap_elem(cancel)
-            time.sleep(0.5)
+            time.sleep(CLICK_SETTLE_DELAY)
             continue
 
         for t in ["以后再说", "忽略", "稍后"]:
@@ -1545,7 +1562,7 @@ def main():
             if c:
                 print(f"    发现弹窗: {_elem_desc(c)}")
                 _tap_elem(c)
-                time.sleep(0.5)
+                time.sleep(CLICK_SETTLE_DELAY)
                 popup_dismissed = True
                 break
         if popup_dismissed:
@@ -1567,7 +1584,7 @@ def main():
         if avatar_elem:
             print(f"    找到头像: {_elem_desc(avatar_elem)}")
             _tap_elem(avatar_elem)
-            if wait_for_ui_condition(is_login_page, timeout=6) is not None:
+            if wait_for_ui_condition(is_login_page, timeout=3) is not None:
                 avatar_found = True
                 print("    [OK] 头像点击已生效，登录页已出现")
                 break
@@ -1577,11 +1594,11 @@ def main():
         if attempt < 4:
             print(f"    [WARN] 第{attempt+1}次未找到头像，按返回重试...")
             back(DEVICE_ID)
-            time.sleep(1)
+            time.sleep(CLICK_RETRY_DELAY)
         else:
             print(f"    [WARN] 第{attempt+1}次未找到头像，尝试在右上角区域点击...")
             _tap_xy(1000, 100)
-            time.sleep(1.5)
+            time.sleep(CLICK_RETRY_DELAY)
 
     if not avatar_found:
         _log("    [FAIL] 第 5 步未通过验证：未进入登录页")
@@ -1589,13 +1606,17 @@ def main():
 
     # ---- 第 6 步：切换国家/地区 ----
     _log("\n[6] 切换国家到美国...")
-    log_global_ui_elements("6 切换国家前")
+    country_elements = log_global_ui_elements("6 切换国家前")
 
     # 当前界面显示 "CN+86"，点击后必须确认国家列表已出现。
-    time.sleep(1)
+    time.sleep(CLICK_SETTLE_DELAY)
     country_list_open = False
-    for _ in range(4):
-        elements = get_ui_elements_safe(DEVICE_ID)
+    for open_attempt in range(4):
+        elements = (
+            country_elements
+            if open_attempt == 0 and country_elements
+            else get_ui_elements_safe(DEVICE_ID)
+        )
         country_button = _find_element_by_id_candidates(elements, ["tv_area_code"])
         if not country_button:
             country_button = next(
@@ -1614,7 +1635,7 @@ def main():
             x1, y1, _, y2 = phone_input.rect
             _tap_xy(max(0, x1 - 100), (y1 + y2) // 2, "国家切换区域")
 
-        if wait_for_ui_condition(is_country_list_page, timeout=5) is not None:
+        if wait_for_ui_condition(is_country_list_page, timeout=3) is not None:
             country_list_open = True
             print("    [OK] 国家切换点击已生效，国家列表已出现")
             break
@@ -1637,20 +1658,20 @@ def main():
 
         if us_elem and us_elem.clickable and us_elem.enabled:
             _tap_elem(us_elem)
-            if wait_for_ui_condition(is_us_country_selected, timeout=5) is not None:
+            if wait_for_ui_condition(is_us_country_selected, timeout=3) is not None:
                 print("    [OK] 已选择 United States，区号已验证为 +1")
                 found = True
                 break
         elif us_elem:
             _tap_elem(us_elem)
-            if wait_for_ui_condition(is_us_country_selected, timeout=5) is not None:
+            if wait_for_ui_condition(is_us_country_selected, timeout=3) is not None:
                 print("    [OK] 已选择 United States，区号已验证为 +1")
                 found = True
                 break
 
         if not found:
             scroll_down_in_list()
-            time.sleep(0.8)
+            time.sleep(CLICK_SETTLE_DELAY)
 
     if not found:
         print("    [WARN] 未找到 United States，尝试直接输入查找...")
@@ -1661,23 +1682,23 @@ def main():
                 us_elem = find_element_by_text("United States", elements, exact_match=False)
                 if us_elem:
                     _tap_elem(us_elem)
-                    if wait_for_ui_condition(is_us_country_selected, timeout=5) is not None:
+                    if wait_for_ui_condition(is_us_country_selected, timeout=3) is not None:
                         print("    [OK] 通过搜索选择 United States，区号已验证为 +1")
                         found = True
                         break
-                time.sleep(0.5)
+                time.sleep(CLICK_RETRY_DELAY)
 
     if not found:
         print("    [FAIL] 第 6 步未通过验证：国家区号不是 United States +1")
         return
 
-    time.sleep(1)
+    time.sleep(CLICK_SETTLE_DELAY)
 
     # ---- 第 7 步：输入手机号 ----
     print(f"\n[7] 输入手机号 {PHONE_NUMBER}...")
-    log_global_ui_elements("7 输入手机号前")
+    phone_elements = log_global_ui_elements("7 输入手机号前")
 
-    if input_phone_number(PHONE_NUMBER):
+    if input_phone_number(PHONE_NUMBER, phone_elements):
         print(f"    [OK] 手机号已输入并验证: {PHONE_NUMBER}")
     else:
         print("    [FAIL] 手机号输入失败，停止任务，避免提交空号码")
@@ -1686,22 +1707,23 @@ def main():
     # 收起键盘，避免挡住登录按钮
     print("    [INFO] 收起键盘...")
     adb_cmd("shell", "input", "keyevent", "4")
-    time.sleep(1)
+    time.sleep(CLICK_SETTLE_DELAY)
     # 再点一下输入框外的空白区域确保键盘完全收起
     _tap_xy(500, 500)
-    time.sleep(0.5)
+    time.sleep(CLICK_SETTLE_DELAY)
 
     # ---- 第 8 步：勾选协议 RadioButton 并点击登录 ----
     print("\n[8] 勾选服务协议和隐私政策并点击登录...")
-    log_global_ui_elements("8 勾选协议并登录前")
+    agreement_elements = log_global_ui_elements("8 勾选协议并登录前")
     agreement_ready = False
     agreement_state_readable = False
     for attempt in range(1, 4):
-        agreement_elements = get_ui_elements_safe(DEVICE_ID)
+        if attempt > 1 or not agreement_elements:
+            agreement_elements = get_ui_elements_safe(DEVICE_ID)
         agreement_control = find_agreement_control_element(agreement_elements)
         if agreement_control is None:
             print(f"    [WARN] 第 {attempt} 次未找到协议控件或 protocol 文本")
-            time.sleep(0.6)
+            time.sleep(CLICK_RETRY_DELAY)
             continue
 
         if "RadioButton" in (agreement_control.class_name or ""):
@@ -1715,8 +1737,8 @@ def main():
             tap_agreement_control(agreement_control)
             checked_elements = wait_for_ui_condition(
                 agreement_radio_is_checked,
-                timeout=3,
-                interval=0.3,
+                timeout=1.5,
+                interval=CLICK_POLL_INTERVAL,
             )
             if checked_elements is not None:
                 agreement_ready = True
@@ -1742,7 +1764,7 @@ def main():
             return
         print("    [INFO] 当前版本不暴露 checked 属性，将由登录页跳转作最终验证")
 
-    login_clicked = find_and_tap_safe(text="登录", clickable=True, retries=5)
+    login_clicked = find_and_tap_safe(text="登录", clickable=True, retries=3)
     if login_clicked:
         print("    [ACTION] 已执行登录点击，等待页面状态验证")
     else:
@@ -1753,25 +1775,29 @@ def main():
             print("    [FAIL] 未找到登录按钮")
             return
 
-    time.sleep(1.5)
+    time.sleep(CLICK_SETTLE_DELAY)
 
     # ---- 第 9 步：验证登录提交结果 ----
     print("\n[9] 验证协议勾选和登录提交状态...")
-    log_global_ui_elements("9 验证登录提交状态")
+    submission_elements = log_global_ui_elements("9 验证登录提交状态")
     submission_verified = False
     login_retried = False
     non_login_rounds = 0
-    for attempt in range(15):
+    for attempt in range(10):
         try:
-            elems = get_ui_elements_safe(DEVICE_ID)
+            elems = (
+                submission_elements
+                if attempt == 0 and submission_elements
+                else get_ui_elements_safe(DEVICE_ID)
+            )
         except Exception as exc:
             print(f"    [WARN] 读取登录提交状态失败，正在重试: {exc}")
-            time.sleep(0.5)
+            time.sleep(CLICK_RETRY_DELAY)
             continue
 
         if not elems:
             print("    [WARN] UI 数据为空，暂不判断登录页已离开")
-            time.sleep(0.5)
+            time.sleep(CLICK_RETRY_DELAY)
             continue
 
         if not is_login_page(elems):
@@ -1780,7 +1806,7 @@ def main():
                 submission_verified = True
                 print("    [OK] 连续两次确认已离开登录页")
                 break
-            time.sleep(0.5)
+            time.sleep(CLICK_SETTLE_DELAY)
             continue
 
         non_login_rounds = 0
@@ -1794,8 +1820,8 @@ def main():
             tap_agreement_control(agreement_radio)
             if wait_for_ui_condition(
                 agreement_radio_is_checked,
-                timeout=3,
-                interval=0.3,
+                timeout=1.5,
+                interval=CLICK_POLL_INTERVAL,
             ) is None:
                 print("    [FAIL] 协议 RadioButton 重新勾选失败")
                 return
@@ -1817,7 +1843,7 @@ def main():
             _tap_elem(login_button)
             login_retried = True
 
-        time.sleep(0.5)
+        time.sleep(CLICK_SETTLE_DELAY)
 
     if not submission_verified:
         print("    [FAIL] 协议虽已操作，但点击登录后仍未离开登录页")
@@ -1827,10 +1853,13 @@ def main():
     else:
         print("    [OK] 第 8/9 步验证通过：协议区域点击已由登录页跳转确认")
 
-    time.sleep(20)
+    # 给验证码 WebView/短信页一个很短的加载窗口，替代原来的固定 20 秒等待。
+    time.sleep(1)
     print("\n[9.5] 检查是否有安全验证...")
-    log_global_ui_elements("9.5 检查安全验证前")
-    elements = get_ui_elements_safe(DEVICE_ID)
+    elements = (
+        log_global_ui_elements("9.5 检查安全验证前")
+        or get_ui_elements_safe(DEVICE_ID)
+    )
     # 等待10秒
 
     has_captcha = find_element_by_id("tcaptcha-img", elements) is not None
@@ -1852,7 +1881,7 @@ def main():
     else:
         print("    - 无安全验证，直接进入登录流程")
 
-    time.sleep(2)
+    time.sleep(CLICK_SETTLE_DELAY)
 
     # ---- 第 10 步：获取并输入短信验证码 ----
     print("\n[10] 获取短信验证码...")
@@ -1864,10 +1893,12 @@ def main():
         return
 
     print(f"\n[11] 输入验证码: {code}...")
-    log_global_ui_elements("11 输入短信验证码前")
+    elements = (
+        log_global_ui_elements("11 输入短信验证码前")
+        or get_ui_elements_safe(DEVICE_ID)
+    )
 
     # 找验证码输入框
-    elements = get_ui_elements_safe(DEVICE_ID)
     code_inputs = [e for e in elements if 'EditText' in e.class_name]
     if not code_inputs:
         print("    [FAIL] 第 11 步失败：未找到验证码输入框")
@@ -1877,16 +1908,19 @@ def main():
         return
     print(f"    [OK] 验证码已输入并读回验证: {code}")
 
-    time.sleep(2)
+    time.sleep(CLICK_SETTLE_DELAY)
 
     # 确认/提交验证码
     print("\n[12] 提交验证码...")
-    log_global_ui_elements("12 提交短信验证码前")
+    submit_elements = log_global_ui_elements("12 提交短信验证码前")
     # 查找并点击提交按钮（确认/确定/下一步/提交）
     submitted = False
     for submit_attempt in range(8):
-        time.sleep(0.8)
-        elements = get_ui_elements_safe(DEVICE_ID)
+        if submit_attempt == 0 and submit_elements:
+            elements = submit_elements
+        else:
+            time.sleep(CLICK_SETTLE_DELAY)
+            elements = get_ui_elements_safe(DEVICE_ID)
         if is_username_or_home_page(elements):
             print("    [OK] 验证码已自动提交，后续页面已出现")
             submitted = True
@@ -1899,7 +1933,7 @@ def main():
             if btn and btn.rect[3] > 1800:  # 底部按钮
                 print(f"    [ACTION] 点击「{btn_text}」提交验证码")
                 _tap_elem(btn)
-                if wait_for_ui_condition(is_username_or_home_page, timeout=8) is not None:
+                if wait_for_ui_condition(is_username_or_home_page, timeout=5) is not None:
                     print("    [OK] 验证码提交已生效，后续页面已出现")
                     submitted = True
                 break
@@ -1910,7 +1944,7 @@ def main():
         print("    [FAIL] 第 12 步未通过验证：提交后未进入用户名页或主页")
         return
 
-    time.sleep(2)
+    time.sleep(CLICK_SETTLE_DELAY)
 
     # ============================================================
     # 后续操作：新账号用户名 → 搜索游戏 → 下载 → 安装 → 启动
@@ -1918,8 +1952,12 @@ def main():
 
     # ---- 第 13 步：处理新账号用户名填写 ----
     print("\n[13] 检查用户名填写页面...")
-    log_global_ui_elements("13 检查用户名页面")
-    username_elements = wait_for_ui_condition(is_username_or_home_page, timeout=25)
+    username_elements = log_global_ui_elements("13 检查用户名页面")
+    if not is_username_or_home_page(username_elements):
+        username_elements = wait_for_ui_condition(
+            is_username_or_home_page,
+            timeout=8,
+        )
     if username_elements is None:
         print("    [FAIL] 第 13 步失败：未出现用户名页、个人页或主页")
         return
@@ -1954,20 +1992,23 @@ def main():
             print("    [FAIL] 用户名已输入，但未找到提交按钮")
             return
         _tap_elem(done_btn)
-        if wait_for_ui_condition(is_home_or_profile_page, timeout=12) is None:
+        if wait_for_ui_condition(is_home_or_profile_page, timeout=6) is None:
             print("    [FAIL] 用户名提交后未进入个人页或主页")
             return
         print("    [OK] 用户名提交已生效，后续页面已出现")
 
-    time.sleep(2)
+    time.sleep(CLICK_SETTLE_DELAY)
 
     # ---- 第 14 步：回到主页并点击搜索栏 ----
     print("\n[14] 回到主页...")
-    log_global_ui_elements("14 返回主页前")
+    home_elements = log_global_ui_elements("14 返回主页前")
     home_ready = False
-    for attempt in range(15):
-        time.sleep(1)
-        elements = get_ui_elements_safe(DEVICE_ID)
+    for attempt in range(8):
+        if attempt == 0 and home_elements:
+            elements = home_elements
+        else:
+            time.sleep(CLICK_SETTLE_DELAY)
+            elements = get_ui_elements_safe(DEVICE_ID)
 
         # 多条件检测是否已在主页
         is_home = False
@@ -2000,17 +2041,17 @@ def main():
         dismiss = find_element_by_id("com.taptap:id/btn_dismiss", elements)
         if dismiss:
             _tap_elem(dismiss)
-            time.sleep(1)
+            time.sleep(CLICK_SETTLE_DELAY)
             continue
 
         container = find_element_by_id("com.taptap:id/btn_container", elements)
         if container:
             _tap_elem(container)
-            time.sleep(1)
+            time.sleep(CLICK_SETTLE_DELAY)
             continue
 
         back(DEVICE_ID)
-        time.sleep(1)
+        time.sleep(CLICK_SETTLE_DELAY)
 
     if not home_ready:
         print("    [FAIL] 第 14 步失败：无法验证已回到主页")
@@ -2026,10 +2067,10 @@ def main():
     #     )
     # if not search_clicked:
     search_clicked = find_and_tap_safe(
-        res_id="com.taptap:id/viewSearchContent", clickable=True, retries=5
+        res_id="com.taptap:id/viewSearchContent", clickable=True, retries=3
     )
     if search_clicked:
-        if wait_for_ui_condition(is_search_page, timeout=6) is None:
+        if wait_for_ui_condition(is_search_page, timeout=3) is None:
             print("    [FAIL] 搜索栏点击后未进入搜索页面")
             return
         print("    [OK] 搜索栏点击已生效，搜索页面已出现")
@@ -2037,11 +2078,14 @@ def main():
         print("    [FAIL] 未找到搜索栏")
         return
 
-    time.sleep(1)
+    time.sleep(CLICK_SETTLE_DELAY)
 
     # ---- 第 15 步：搜索游戏 ----
     print(f"\n[15] 搜索游戏「{GAME_NAME}」...")
-    log_global_ui_elements("15 搜索游戏前")
+    elements = (
+        log_global_ui_elements("15 搜索游戏前")
+        or get_ui_elements_safe(DEVICE_ID)
+    )
 
     # input_clicked = find_and_tap_safe(
     #     res_id="com.taptap:id/input_box", clickable=True, retries=5
@@ -2057,7 +2101,6 @@ def main():
     #     restore_keyboard(original_ime, DEVICE_ID)
     #     print("    [OK] 已输入搜索词")
     # else:
-    elements = get_ui_elements_safe(DEVICE_ID)
     inputs = find_text_input_elements(elements)
     if inputs:
         if not input_text_verified(inputs[0], GAME_NAME):
@@ -2068,14 +2111,14 @@ def main():
         print("    [FAIL] 无法输入搜索词")
         return
 
-    time.sleep(1)
+    time.sleep(CLICK_SETTLE_DELAY)
     print("    点击搜索按钮...")
     search_btn = find_and_tap_safe(
-        text="搜索", clickable=True, retries=5
+        text="搜索", clickable=True, retries=3
     )
     if not search_btn:
         search_btn = find_and_tap_safe(
-            res_id="com.taptap:id/tvSure", clickable=True, retries=5
+            res_id="com.taptap:id/tvSure", clickable=True, retries=3
         )
     if not search_btn:
         enter_result = adb_cmd("shell", "input", "keyevent", "66")
@@ -2085,21 +2128,23 @@ def main():
 
     if wait_for_ui_condition(
         lambda items: search_results_visible(items, GAME_NAME),
-        timeout=12,
+        timeout=6,
     ) is None:
         print("    [FAIL] 第 15 步未通过验证：未出现搜索结果")
         return
     print("    [OK] 搜索已提交，目标游戏结果已出现")
 
-    time.sleep(2)
+    time.sleep(CLICK_SETTLE_DELAY)
 
     # ---- 第 16 步：选择游戏 ----
     print(f"\n[16] 选择游戏「{GAME_NAME}」...")
-    log_global_ui_elements("16 选择游戏前")
+    elements = (
+        log_global_ui_elements("16 选择游戏前")
+        or get_ui_elements_safe(DEVICE_ID)
+    )
     game_clicked = False
 
     # 1) 搜索完成后，过滤掉输入框本身，只找结果列表中的游戏名
-    elements = get_ui_elements_safe(DEVICE_ID)
     # 排除输入框（搜索栏里的文字）
     candidates = [
         e for e in elements
@@ -2118,13 +2163,13 @@ def main():
         cy = (title_elem.rect[1] + title_elem.rect[3]) // 2
         print(f"    [ACTION] 找到「{GAME_NAME}」({cx},{cy})，点击中心")
         _tap_xy(cx, cy)
-        time.sleep(1.5)
+        time.sleep(CLICK_SETTLE_DELAY)
         game_clicked = True
 
     # 2) 备选：找 brand_app
     if not game_clicked:
         game_clicked = find_and_tap_safe(
-            res_id="com.taptap:id/brand_app", clickable=True, retries=5, delay=1.5
+            res_id="com.taptap:id/brand_app", clickable=True, retries=3
         )
 
     # 3) 再备选：找第一个游戏结果项
@@ -2136,7 +2181,7 @@ def main():
                     or "item" in (e.resource_id or "").lower()):
                 if e.clickable:
                     _tap_elem(e)
-                    time.sleep(1.5)
+                    time.sleep(CLICK_SETTLE_DELAY)
                     game_clicked = True
                     break
         if not game_clicked:
@@ -2144,7 +2189,7 @@ def main():
             for e in sorted(elements, key=lambda x: (x.rect[2]-x.rect[0])*(x.rect[3]-x.rect[1]), reverse=True):
                 if e.class_name and "ViewGroup" in e.class_name and e.clickable:
                     _tap_elem(e)
-                    time.sleep(1.5)
+                    time.sleep(CLICK_SETTLE_DELAY)
                     game_clicked = True
                     break
 
@@ -2154,20 +2199,22 @@ def main():
 
     if wait_for_ui_condition(
         lambda items: is_game_detail_page(items, GAME_NAME),
-        timeout=10,
+        timeout=5,
     ) is None:
         print("    [FAIL] 第 16 步未通过验证：点击后未进入目标游戏详情页")
         return
     print("    [OK] 已验证进入目标游戏详情页")
-    time.sleep(2)
+    time.sleep(CLICK_SETTLE_DELAY)
 
     # ---- 第 17 步：点击下载 ----
     print("\n[17] 点击下载...")
-    log_global_ui_elements("17 点击下载前")
+    elements = (
+        log_global_ui_elements("17 点击下载前")
+        or get_ui_elements_safe(DEVICE_ID)
+    )
     download_clicked = False
 
     # 1) 页面底部可能有多个"下载"文本，取最底部的（真正的下载按钮在底部）
-    elements = get_ui_elements_safe(DEVICE_ID)
     download_texts = find_elements_by_text("下载", elements, exact_match=False)
     text_elem = None
     if download_texts:
@@ -2192,29 +2239,32 @@ def main():
     # 2) 备选：btn_container
     if not download_clicked:
         download_clicked = find_and_tap_safe(
-            res_id="com.taptap:id/btn_container", clickable=True, retries=5
+            res_id="com.taptap:id/btn_container", clickable=True, retries=3
         )
 
     if not download_clicked:
         print("    [FAIL] 未找到下载按钮")
         return
 
-    if wait_for_ui_condition(download_has_started, timeout=15) is None:
+    if wait_for_ui_condition(download_has_started, timeout=8) is None:
         print("    [FAIL] 第 17 步未通过验证：下载状态没有发生变化")
         return
     print("    [OK] 下载点击已生效，已检测到下载/安装状态")
 
-    time.sleep(2)
+    time.sleep(CLICK_SETTLE_DELAY)
     print("\n[18] 监控下载进度 & 处理安装弹窗...")
-    log_global_ui_elements("18 监控下载和安装前")
+    download_elements = log_global_ui_elements("18 监控下载和安装前")
     download_complete = False
     installed = False
     installer_checkbox_clicked = False
 
     for check_round in range(240):
-        time.sleep(1.5)
         try:
-            elements = get_ui_elements_safe(DEVICE_ID)
+            if check_round == 0 and download_elements:
+                elements = download_elements
+            else:
+                time.sleep(1)
+                elements = get_ui_elements_safe(DEVICE_ID)
         except RuntimeError:
             continue
 
@@ -2273,7 +2323,7 @@ def main():
             download_complete = True
             print("    [ACTION] 发现安装请求弹窗，点击「继续」")
             _tap_elem(continue_btn)
-            time.sleep(1)
+            time.sleep(CLICK_RETRY_DELAY)
             continue
 
         # 弹窗2: "是否允许TapTap安装应用？" → "允许"
@@ -2285,7 +2335,7 @@ def main():
             download_complete = True
             print("    [ACTION] 发现安装权限弹窗，点击「允许」")
             _tap_elem(allow_btn)
-            time.sleep(1)
+            time.sleep(CLICK_RETRY_DELAY)
             continue
 
         # 弹窗2b: "TapTap频繁安装应用" → 点"验证"
@@ -2302,13 +2352,13 @@ def main():
                 download_complete = True
                 print("    [ACTION] 发现频繁安装验证弹窗，点击「验证」")
                 _tap_elem(verify_btn)
-                time.sleep(2)
+                time.sleep(CLICK_RETRY_DELAY)
                 continue
             # 找不到按钮就点 title 区域下方（弹窗右下角）
             download_complete = True
             print("    [ACTION] 点击验证区域")
             _tap_xy(720, 2501)
-            time.sleep(2)
+            time.sleep(CLICK_RETRY_DELAY)
             continue
 
         # 弹窗2c: 拖动滑块验证（WebView 内嵌）
@@ -2340,7 +2390,7 @@ def main():
             print(f"    [ACTION] 滑块验证: 把手={_elem_desc(slider_btn) if slider_btn else 'fallback'} 拖动 ({sx},{sy}) → ({ex},{sy})")
             # WebView 滑块需要用 touch motionevent 模拟真实手指拖动
             _swipe_slider(sx, sy, ex, sy)
-            time.sleep(2)
+            time.sleep(CLICK_RETRY_DELAY)
             continue
 
         # 弹窗3: MIUI / HyperOS 安装确认页
@@ -2402,7 +2452,7 @@ def main():
             download_complete = True
             print(f"    [ACTION] 点击安装流程按钮「{btn_text}」")
             _tap_elem(install_btn)
-            time.sleep(1)
+            time.sleep(CLICK_RETRY_DELAY)
             if "完成" in btn_text:
                 if _package_is_installed(GAME_PACKAGE):
                     installed = True
@@ -2446,7 +2496,7 @@ def main():
                 download_complete = True
                 print("    [ACTION] 发现安装请求弹窗，点击「继续」")
                 _tap_elem(continue_btn)
-                time.sleep(1)
+                time.sleep(CLICK_RETRY_DELAY)
                 handled = True
 
             allow_btn = find_with_multiple_conditions(
@@ -2457,7 +2507,7 @@ def main():
                 download_complete = True
                 print("    [ACTION] 发现安装权限弹窗，点击「允许」")
                 _tap_elem(allow_btn)
-                time.sleep(1)
+                time.sleep(CLICK_RETRY_DELAY)
                 handled = True
 
             verify_title = find_with_multiple_conditions(
@@ -2473,12 +2523,12 @@ def main():
                     download_complete = True
                     print("    [ACTION] 点击安装验证")
                     _tap_elem(verify_btn)
-                    time.sleep(2)
+                    time.sleep(CLICK_RETRY_DELAY)
                     handled = True
                 else:
                     download_complete = True
                     _tap_xy(720, 2501)
-                    time.sleep(2)
+                    time.sleep(CLICK_RETRY_DELAY)
                     handled = True
 
             slider_text = find_with_multiple_conditions(
@@ -2505,7 +2555,7 @@ def main():
                 ex = sx + 700
                 print(f"    [ACTION] 滑块验证，拖动 ({sx},{sy}) → ({ex},{sy})")
                 _swipe_slider(sx, sy, ex, sy)
-                time.sleep(2)
+                time.sleep(CLICK_RETRY_DELAY)
                 handled = True
 
             checkbox = (
@@ -2565,7 +2615,7 @@ def main():
                 download_complete = True
                 print(f"    [ACTION] 点击安装流程按钮「{btn_text}」")
                 _tap_elem(install_btn)
-                time.sleep(1)
+                time.sleep(CLICK_RETRY_DELAY)
                 if "完成" in btn_text:
                     if _package_is_installed(GAME_PACKAGE):
                         installed = True
@@ -2584,7 +2634,7 @@ def main():
                 break
 
             if not handled:
-                time.sleep(1.5)
+                time.sleep(0.75)
         if not installed:
             print("    [FAIL] 第 18 步未通过验证：安装包不存在")
             return
