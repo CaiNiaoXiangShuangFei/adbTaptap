@@ -7,6 +7,7 @@ TapTap 自动登录脚本
 import argparse
 import base64
 import io
+import json
 import os
 import random
 import re
@@ -27,6 +28,7 @@ from phone_agent.adb import *
 
 # ============ 日志系统 ============
 _LOG_FILE = None
+_LOG_LOCK = threading.Lock()
 _WORKFLOW_COMPLETED = False
 
 def _init_log():
@@ -34,15 +36,23 @@ def _init_log():
     log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)))
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(log_dir, f"taptap_log_{timestamp}.log")
-    _LOG_FILE = open(log_path, "w", encoding="utf-8")
+    with _LOG_LOCK:
+        _LOG_FILE = open(log_path, "w", encoding="utf-8")
     return log_path
+
+
+def _write_log_file(msg: str = ""):
+    """只写本地日志，避免全量 UI 元素刷满控制台。"""
+    with _LOG_LOCK:
+        if _LOG_FILE:
+            _LOG_FILE.write(msg + "\n")
+            _LOG_FILE.flush()
+
 
 def _log(msg: str = ""):
     sys.stdout.write(msg + "\n")
     sys.stdout.flush()
-    if _LOG_FILE:
-        _LOG_FILE.write(msg + "\n")
-        _LOG_FILE.flush()
+    _write_log_file(msg)
 
 def _log_action(action: str, elem=None, x: int = None, y: int = None):
     """记录操作：动作类型 + 元素标识 + 坐标"""
@@ -60,9 +70,10 @@ def _log_action(action: str, elem=None, x: int = None, y: int = None):
 
 def _close_log():
     global _LOG_FILE
-    if _LOG_FILE:
-        _LOG_FILE.close()
-        _LOG_FILE = None
+    with _LOG_LOCK:
+        if _LOG_FILE:
+            _LOG_FILE.close()
+            _LOG_FILE = None
 
 # ============ 配置 ============
 TAPTAP_PACKAGE = "com.taptap"
@@ -313,9 +324,61 @@ def get_ui_elements_safe(device_id, *, background: bool = False) -> list:
         _UI_DUMP_LOCK.release()
 
 
+def log_global_ui_elements(step_label: str) -> list:
+    """获取当前全局 UI 元素，并以 JSON Lines 形式保存到本地运行日志。"""
+    captured_at = datetime.now().isoformat(timespec="milliseconds")
+    begin_marker = f"[UI-ELEMENTS-BEGIN] step={step_label} captured_at={captured_at}"
+    _write_log_file(begin_marker)
+    try:
+        elements = get_ui_elements_safe(DEVICE_ID)
+    except Exception as exc:
+        _write_log_file(
+            f"[UI-ELEMENTS-ERROR] step={step_label} "
+            f"error={type(exc).__name__}: {exc}"
+        )
+        _write_log_file(f"[UI-ELEMENTS-END] step={step_label} count=0")
+        _log(f"    [WARN] 第 {step_label} 步全局元素获取失败，详情已写入日志")
+        return []
+
+    for index, elem in enumerate(elements):
+        rect = getattr(elem, "rect", None)
+        bounds = getattr(elem, "bounds", None)
+        record = {
+            "index": index,
+            "resource_id": getattr(elem, "resource_id", None),
+            "text": getattr(elem, "text", None),
+            "content_description": getattr(
+                elem,
+                "content_description",
+                getattr(elem, "content_desc", None),
+            ),
+            "class_name": getattr(elem, "class_name", None),
+            "rect": list(rect) if isinstance(rect, (list, tuple)) else rect,
+            "bounds": list(bounds) if isinstance(bounds, (list, tuple)) else bounds,
+            "clickable": getattr(elem, "clickable", None),
+            "enabled": getattr(elem, "enabled", None),
+            "checkable": getattr(elem, "checkable", None),
+            "checked": getattr(elem, "checked", None),
+            "focusable": getattr(elem, "focusable", None),
+            "focused": getattr(elem, "focused", None),
+            "selected": getattr(elem, "selected", None),
+            "scrollable": getattr(elem, "scrollable", None),
+            "password": getattr(elem, "password", None),
+        }
+        _write_log_file(
+            "[UI-ELEMENT] "
+            + json.dumps(record, ensure_ascii=False, default=str, separators=(",", ":"))
+        )
+
+    _write_log_file(f"[UI-ELEMENTS-END] step={step_label} count={len(elements)}")
+    _log(f"    [UI] 第 {step_label} 步全局元素已保存到日志，共 {len(elements)} 个")
+    return elements
+
+
 def clear_app_data(package: str) -> bool:
     """清除应用数据。"""
     print(f"[1] 清除 {package} 数据...")
+    log_global_ui_elements("1 清除应用数据前")
     commands = [
         ("shell", "pm", "clear", "--user", "0", package),
         ("shell", "pm", "clear", package),
@@ -417,6 +480,7 @@ def _wait_package_foreground(package: str, timeout: float = 12) -> bool:
 def launch_app_safe(app_name: str) -> bool:
     """启动应用并验证目标进程确实存在。"""
     print(f"[2] 启动 {app_name}...")
+    log_global_ui_elements("2 启动应用前")
     for attempt in range(3):
         if launch_app(app_name, DEVICE_ID) and _wait_package_running(TAPTAP_PACKAGE):
             print(f"    [OK] 应用已启动并检测到进程: {TAPTAP_PACKAGE}")
@@ -1283,6 +1347,7 @@ def main():
 
     # ---- 第 3 步：隐私政策和权限弹窗 ----
     _log("\n[3] 处理初始化弹窗（隐私政策 + 权限）...")
+    log_global_ui_elements("3 处理初始化弹窗前")
 
     handled = {"privacy": False}
     idle_rounds = 0
@@ -1380,6 +1445,7 @@ def main():
 
     # ---- 第 5 步：返回主页，点击头像进入登录 ----
     _log("\n[5] 导航到登录页...")
+    log_global_ui_elements("5 导航到登录页前")
 
     # 检查是否在主页：查找底部导航栏 tb_layout_home_bottom_bar
     home_elems = get_ui_elements_safe(DEVICE_ID)
@@ -1476,6 +1542,7 @@ def main():
 
     # ---- 第 6 步：切换国家/地区 ----
     _log("\n[6] 切换国家到美国...")
+    log_global_ui_elements("6 切换国家前")
 
     # 当前界面显示 "CN+86"，点击后必须确认国家列表已出现。
     time.sleep(1)
@@ -1561,6 +1628,7 @@ def main():
 
     # ---- 第 7 步：输入手机号 ----
     print(f"\n[7] 输入手机号 {PHONE_NUMBER}...")
+    log_global_ui_elements("7 输入手机号前")
 
     if input_phone_number(PHONE_NUMBER):
         print(f"    [OK] 手机号已输入并验证: {PHONE_NUMBER}")
@@ -1578,6 +1646,7 @@ def main():
 
     # ---- 第 8 步：勾选协议 RadioButton 并点击登录 ----
     print("\n[8] 勾选服务协议和隐私政策并点击登录...")
+    log_global_ui_elements("8 勾选协议并登录前")
     agreement_checked = False
     for attempt in range(1, 4):
         agreement_elements = get_ui_elements_safe(DEVICE_ID)
@@ -1624,6 +1693,7 @@ def main():
 
     # ---- 第 9 步：验证登录提交结果 ----
     print("\n[9] 验证协议勾选和登录提交状态...")
+    log_global_ui_elements("9 验证登录提交状态")
     submission_verified = False
     login_retried = False
     non_login_rounds = 0
@@ -1691,6 +1761,7 @@ def main():
 
     time.sleep(20)
     print("\n[9.5] 检查是否有安全验证...")
+    log_global_ui_elements("9.5 检查安全验证前")
     elements = get_ui_elements_safe(DEVICE_ID)
     # 等待10秒
 
@@ -1717,6 +1788,7 @@ def main():
 
     # ---- 第 10 步：获取并输入短信验证码 ----
     print("\n[10] 获取短信验证码...")
+    log_global_ui_elements("10 获取短信验证码前")
     code = wait_for_sms_code(max_wait=120, interval=5)
 
     if not code:
@@ -1724,6 +1796,7 @@ def main():
         return
 
     print(f"\n[11] 输入验证码: {code}...")
+    log_global_ui_elements("11 输入短信验证码前")
 
     # 找验证码输入框
     elements = get_ui_elements_safe(DEVICE_ID)
@@ -1740,6 +1813,7 @@ def main():
 
     # 确认/提交验证码
     print("\n[12] 提交验证码...")
+    log_global_ui_elements("12 提交短信验证码前")
     # 查找并点击提交按钮（确认/确定/下一步/提交）
     submitted = False
     for submit_attempt in range(8):
@@ -1776,6 +1850,7 @@ def main():
 
     # ---- 第 13 步：处理新账号用户名填写 ----
     print("\n[13] 检查用户名填写页面...")
+    log_global_ui_elements("13 检查用户名页面")
     username_elements = wait_for_ui_condition(is_username_or_home_page, timeout=25)
     if username_elements is None:
         print("    [FAIL] 第 13 步失败：未出现用户名页、个人页或主页")
@@ -1820,6 +1895,7 @@ def main():
 
     # ---- 第 14 步：回到主页并点击搜索栏 ----
     print("\n[14] 回到主页...")
+    log_global_ui_elements("14 返回主页前")
     home_ready = False
     for attempt in range(15):
         time.sleep(1)
@@ -1897,6 +1973,7 @@ def main():
 
     # ---- 第 15 步：搜索游戏 ----
     print(f"\n[15] 搜索游戏「{GAME_NAME}」...")
+    log_global_ui_elements("15 搜索游戏前")
 
     # input_clicked = find_and_tap_safe(
     #     res_id="com.taptap:id/input_box", clickable=True, retries=5
@@ -1950,6 +2027,7 @@ def main():
 
     # ---- 第 16 步：选择游戏 ----
     print(f"\n[16] 选择游戏「{GAME_NAME}」...")
+    log_global_ui_elements("16 选择游戏前")
     game_clicked = False
 
     # 1) 搜索完成后，过滤掉输入框本身，只找结果列表中的游戏名
@@ -2017,6 +2095,7 @@ def main():
 
     # ---- 第 17 步：点击下载 ----
     print("\n[17] 点击下载...")
+    log_global_ui_elements("17 点击下载前")
     download_clicked = False
 
     # 1) 页面底部可能有多个"下载"文本，取最底部的（真正的下载按钮在底部）
@@ -2059,6 +2138,7 @@ def main():
 
     time.sleep(2)
     print("\n[18] 监控下载进度 & 处理安装弹窗...")
+    log_global_ui_elements("18 监控下载和安装前")
     download_complete = False
     installed = False
     installer_checkbox_clicked = False
@@ -2448,6 +2528,7 @@ def main():
 
     # ---- 第 19 步：启动游戏 ----
     _log("\n[19] 启动游戏并等待...")
+    log_global_ui_elements("19 启动游戏前")
     launch_result = adb_cmd(
         "shell", "monkey", "-p", GAME_PACKAGE,
         "-c", "android.intent.category.LAUNCHER", "1",
