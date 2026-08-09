@@ -1,0 +1,16 @@
+# 虚拟环境
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 运行日志
+taptap_log_*.log
+*.log

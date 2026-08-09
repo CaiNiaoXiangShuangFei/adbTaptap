@@ -1,0 +1,1862 @@
+"""
+TapTap 自动登录脚本
+- 使用 XML 解析处理大部分 UI 操作（稳定、快速）
+- 使用 AI 模型处理安全验证（动态验证码）
+"""
+
+import argparse
+import argparse
+import base64
+import io
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+
+sys.stdout.reconfigure(errors='replace')
+from io import BytesIO
+
+import requests
+from PIL import Image
+
+from phone_agent.adb import *
+from phone_agent.adb.device import _get_adb_prefix
+
+# ============ 日志系统 ============
+_LOG_FILE = None
+
+def _init_log():
+    global _LOG_FILE
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)))
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(log_dir, f"taptap_log_{timestamp}.log")
+    _LOG_FILE = open(log_path, "w", encoding="utf-8")
+    return log_path
+
+def _log(msg: str = ""):
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
+    if _LOG_FILE:
+        _LOG_FILE.write(msg + "\n")
+        _LOG_FILE.flush()
+
+def _log_action(action: str, elem=None, x: int = None, y: int = None):
+    """记录操作：动作类型 + 元素标识 + 坐标"""
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    parts = [f"[{ts}] {action}"]
+    if elem:
+        rid = elem.resource_id or "-"
+        txt = (elem.text or "").replace("\n", "\\n")[:40]
+        cls = elem.class_name or "-"
+        r = elem.rect
+        parts.append(f"| id={rid} | text='{txt}' | class={cls} | rect={r} | center={(r[0]+r[2])//2},{(r[1]+r[3])//2}")
+    if x is not None and y is not None:
+        parts.append(f"| tap=({x},{y})")
+    _log("".join(parts))
+
+def _close_log():
+    global _LOG_FILE
+    if _LOG_FILE:
+        _LOG_FILE.close()
+        _LOG_FILE = None
+
+# ============ 配置 ============
+TAPTAP_PACKAGE = "com.taptap"
+SMS_API_URL = "http://a.62-us.com/api/get_sms?key=03b891d2d74603649eb43c0dff4fe43a"
+PHONE_NUMBER = "3412640535"
+PHONE_COUNTRY = "United States"
+GAME_NAME = "我的休闲时光"
+
+DEFAULT_DEVICE_ID = "192.168.31.244:37145"
+
+# 云码识别配置（用于安全验证）
+JFBYM_API_URL = "http://api.jfbym.com/api/YmServer/customApi"
+JFBYM_TOKEN = "E7LhAfiKssKDUGCudpvAhgSfOoSeYuSoc5_CsEM5ONI"
+JFBYM_TYPE = "50009"
+
+
+# ============ 命令行参数 ============
+def parse_args():
+    parser = argparse.ArgumentParser(description="TapTap 自动登录 + 下载脚本")
+    parser.add_argument("--device", "-d", help="设备 ID（IP:PORT 或序列号），不指定则列出可用设备")
+    parser.add_argument("--sms-api", help="短信验证码 API 地址", default=None)
+    parser.add_argument("--phone", help="手机号", default=None)
+    parser.add_argument("--game", help="要搜索下载的游戏名", default=None)
+    return parser.parse_args()
+
+
+def resolve_device_id(args_device: str | None) -> str:
+    """解析目标设备 ID。支持 --device 参数指定，否则列出设备供选择。"""
+    if args_device:
+        return args_device
+
+    devices = list_devices()
+    online = [d for d in devices if d.state == "device"]
+
+    if len(online) == 1:
+        dev = online[0]
+        print(f"    [OK] 自动选择唯一在线设备: {dev.serial}")
+        return dev.serial
+
+    if len(online) > 1:
+        print("    [INFO] 检测到多台在线设备：")
+        for i, dev in enumerate(online):
+            print(f"           [{i}] {dev.serial}")
+        while True:
+            try:
+                idx = int(input("    请选择设备序号: ").strip())
+                if 0 <= idx < len(online):
+                    return online[idx].serial
+            except (ValueError, IndexError):
+                pass
+            print("    输入无效，请重新输入")
+
+    # 无在线设备，使用默认配置
+    print(f"    [WARN] 无在线设备，使用默认配置: {DEFAULT_DEVICE_ID}")
+    return DEFAULT_DEVICE_ID
+
+
+ARGS = parse_args()
+DEVICE_ID = resolve_device_id(ARGS.device)
+
+# 用 CLI 参数覆盖配置
+if ARGS.sms_api:
+    SMS_API_URL = ARGS.sms_api
+if ARGS.phone:
+    PHONE_NUMBER = ARGS.phone
+if ARGS.game:
+    GAME_NAME = ARGS.game
+
+
+# ============ 辅助函数 ============
+
+def adb_cmd(*args) -> subprocess.CompletedProcess:
+    prefix = _adb_prefix(DEVICE_ID) if _ADB_PATH else _get_adb_prefix(DEVICE_ID)
+    return subprocess.run(prefix + list(args), capture_output=True, text=True, errors='replace')
+
+
+# 在 sandbox 环境下 adb 可能不在 PATH 中，探测 adb 路径
+_ADB_PATH = shutil.which("adb")
+if not _ADB_PATH:
+    for _p in [os.path.join(os.path.expanduser("~"), "platform-tools", "adb.exe"),
+               os.path.join(os.path.expanduser("~"), "adb", "adb.exe"),
+               r"D:\platform-tools\adb.exe",
+               r"C:\Users\admin.LAPTOP\adb.exe",
+               r"D:\android\platform-tools\adb.exe",
+               r"C:\adb\adb.exe"]:
+        if os.path.isfile(_p):
+            _ADB_PATH = _p
+            break
+
+if not _ADB_PATH:
+    print("[FAIL] 找不到 adb.exe，请设置环境变量或指定路径")
+    sys.exit(1)
+
+print(f"    [OK] 使用 adb: {_ADB_PATH}")
+
+if _ADB_PATH:
+    # 替换 phone_agent 里的 _get_adb_prefix 返回完整路径
+    import phone_agent.adb.device as _dev_mod
+    import phone_agent.adb.input as _inp_mod
+    import phone_agent.adb.screenshot as _scr_mod
+    import phone_agent.adb.uiautomator as _ui_mod
+    _orig_prefix = _dev_mod._get_adb_prefix
+    def _adb_prefix(device_id=None):
+        p = _orig_prefix(device_id)
+        p[0] = _ADB_PATH
+        return p
+    _dev_mod._get_adb_prefix = _adb_prefix
+    _inp_mod._get_adb_prefix = _adb_prefix
+    _scr_mod._get_adb_prefix = _adb_prefix
+    _ui_mod._get_adb_prefix = _adb_prefix
+
+
+def _extract_ip(device_id: str) -> str:
+    """从 device_id 中提取纯 IP（去掉端口部分）。"""
+    return device_id.split(":")[0]
+
+
+# 保存最初配置的端口，用于重连时尝试
+_CONFIGURED_PORT = DEVICE_ID.split(":")[1] if ":" in DEVICE_ID else "5555"
+
+
+def ensure_device_connected() -> bool:
+    """检查设备是否在线，不在线则尝试重连（自动尝试多个端口）。"""
+    global DEVICE_ID
+    ip = _extract_ip(DEVICE_ID)
+    # 按优先级尝试多个端口：当前端口 -> 5555（tcpip模式）
+    ports_to_try = [_CONFIGURED_PORT, "5555"]
+    # 去重但保持顺序
+    seen = set()
+    ports = []
+    for p in ports_to_try:
+        if p not in seen:
+            seen.add(p)
+            ports.append(p)
+
+    for port in ports:
+        target = f"{ip}:{port}"
+        for attempt in range(3):
+            subprocess.run(
+                ["d:\\platform-tools\\adb.exe", "connect", target],
+                capture_output=True, text=True, timeout=5, errors='replace'
+            )
+            time.sleep(0.5)
+            check = subprocess.run(
+                ["d:\\platform-tools\\adb.exe", "-s", target, "get-state"],
+                capture_output=True, text=True, timeout=3, errors='replace'
+            )
+            if check.returncode == 0 and "device" in check.stdout.strip():
+                # 重连成功后更新 DEVICE_ID
+                if DEVICE_ID != target:
+                    DEVICE_ID = target
+                    print(f"    [OK] 端口已更新: {target}")
+                return True
+            if attempt < 2:
+                print(f"    [WARN] {target} 连接失败，重试中...")
+                time.sleep(2)
+        print(f"    [WARN] 端口 {port} 不可用，尝试下一个...")
+    return False
+
+
+def get_ui_elements_safe(device_id) -> list:
+    """带重连的 get_ui_elements。"""
+    for _ in range(3):
+        try:
+            return get_ui_elements(device_id)
+        except RuntimeError as e:
+            if "not found" in str(e).lower():
+                print("    [WARN] 设备断连，尝试重连...")
+                if ensure_device_connected():
+                    time.sleep(1)
+                    continue
+            raise
+    return []
+
+
+def clear_app_data(package: str) -> bool:
+    """清除应用数据。"""
+    print(f"[1] 清除 {package} 数据...")
+    result = adb_cmd("shell", "pm", "clear", package)
+    if result.returncode == 0:
+        print("    [OK] 数据已清除")
+        return True
+    print(f"    [FAIL] 清除失败: {result.stderr}")
+    return False
+
+
+def launch_app_safe(app_name: str) -> bool:
+    """启动应用，带重试。"""
+    print(f"[2] 启动 {app_name}...")
+    for _ in range(3):
+        if launch_app(app_name, DEVICE_ID):
+            print("    [OK] 应用已启动")
+            return True
+        time.sleep(1)
+    print("    [FAIL] 启动失败")
+    return False
+
+
+def _elem_desc(elem) -> str:
+    """生成元素的简短描述（resource-id / text / bounds）。"""
+    parts = []
+    if elem.resource_id:
+        parts.append(elem.resource_id)
+    if elem.text:
+        parts.append(f"'{elem.text}'")
+    if not parts:
+        parts.append(elem.class_name)
+    parts.append(f"[{elem.rect[0]},{elem.rect[1]}][{elem.rect[2]},{elem.rect[3]}]")
+    return " | ".join(parts)
+
+# ---- 保存原始引用（避免被批量替换覆盖） ----
+_raw_tap_element = tap_element
+_raw_tap = tap
+
+# ---- 带日志的点击封装 ----
+def _tap_elem(elem, label: str = ""):
+    """点击元素并记录日志。"""
+    _log_action(f"CLICK {label}" if label else "CLICK", elem=elem)
+    _raw_tap_element(elem, DEVICE_ID)
+
+def _tap_xy(x: int, y: int, label: str = ""):
+    """点击坐标并记录日志。"""
+    _log_action(f"TAP {label}" if label else "TAP", x=x, y=y)
+    _raw_tap(x, y, DEVICE_ID)
+
+
+def find_and_tap_safe(text: str = None, desc: str = None, res_id: str = None,
+                      class_name: str = None, clickable: bool = True,
+                      retries: int = 3, delay: float = 1.0) -> bool:
+    """带重试的查找并点击（捕获 uiautomator 暂时失败）。"""
+    for i in range(retries):
+        try:
+            elem = find_with_multiple_conditions(
+                text=text, desc=desc, res_id=res_id,
+                class_name=class_name, clickable=clickable,
+                device_id=DEVICE_ID
+            )
+        except RuntimeError as e:
+            if i < retries - 1:
+                time.sleep(2.0)
+                continue
+            return False
+        if elem:
+            _log(f"      → 点击元素: {_elem_desc(elem)}")
+            _tap_elem(elem)
+            time.sleep(delay)
+            return True
+        if i < retries - 1:
+            time.sleep(1.5)
+    return False
+
+
+def wait_and_tap(text: str = None, desc: str = None, timeout: float = 8.0) -> bool:
+    """等待元素出现并点击。"""
+    if text:
+        elem = wait_for_element(
+            find_element_by_text,
+            timeout=timeout, check_interval=0.8,
+            text=text, device_id=DEVICE_ID
+        )
+    elif desc:
+        elem = wait_for_element(
+            find_element_by_desc,
+            timeout=timeout, check_interval=0.8,
+            desc=desc, device_id=DEVICE_ID
+        )
+    else:
+        return False
+    if elem:
+        print(f"      → 点击元素: {_elem_desc(elem)}")
+        _tap_elem(elem)
+        time.sleep(1)
+        return True
+    return False
+
+
+def scroll_down_in_list(steps: int = 3) -> None:
+    """在列表中向下滑动（用于选择国家/地区）。"""
+    adb_cmd("shell", "input", "swipe", "500", "1500", "500", "500", "300")
+    time.sleep(1)
+
+
+def _swipe_slider(x1: int, y1: int, x2: int, y2: int) -> None:
+    """用 motionevent 序列模拟真实手指拖动滑块（WebView 验证码必须用这种方式）。"""
+    steps = 40
+    dx = (x2 - x1) // steps
+    # DOWN
+    adb_cmd("shell", "input", "motionevent", "DOWN", str(x1), str(y1))
+    # MOVE 逐步拖动（先慢后快模拟真人）
+    for i in range(1, steps + 1):
+        tx = x1 + dx * i
+        adb_cmd("shell", "input", "motionevent", "MOVE", str(tx), str(y2))
+        time.sleep(0.015)
+    # 在终点停留一下
+    time.sleep(0.3)
+    # UP
+    adb_cmd("shell", "input", "motionevent", "UP", str(x2), str(y2))
+
+
+# ============ 安全验证（云码识别） ============
+
+def find_captcha_question(elements) -> str:
+    """
+    从 UI 元素中查找验证码问题文本（如"点击【E】"）。
+    对应的 XPath: *[resourceId='tcaptcha_iframe'] > ... > *[class='android.widget.TextView']
+    """
+    # 先找明确包含点击指令且含字母的文本
+    for elem in elements:
+        if not elem.text:
+            continue
+        t = elem.text.strip()
+        if any(kw in t for kw in ["点击", "选择", "确认", "请"]) and re.search(r'[A-Za-z\u4e00-\u9fff]', t):
+            return t
+
+    # 退一步：找任何含大写字母的短文本
+    for elem in elements:
+        if elem.text and re.search(r'[A-Z]', elem.text) and len(elem.text) < 30:
+            return elem.text
+
+    # 再退一步：找 resource-id 含 vtt 或 ctcontainer 的相邻 TextView
+    for elem in elements:
+        if elem.resource_id and ("vtt" in elem.resource_id or "ct" in elem.resource_id):
+            return elem.text or ""
+
+    return ""
+
+
+def find_captcha_image(elements, device_id: str):
+    """
+    查找验证码图片区域 tcaptcha-img。
+    返回捕获到的 PIL Image，或 None。
+    """
+    captcha_elem = find_element_by_id("tcaptcha-img", elements)
+    if captcha_elem:
+        return captcha_elem
+
+    # 备选：找 resource-id 含 imgarea 或 captcha-img 的元素
+    for elem in elements:
+        if elem.resource_id and ("imgarea" in elem.resource_id or "captcha-img" in elem.resource_id or "img" in elem.resource_id.lower()):
+            return elem
+
+    return None
+
+
+def crop_captcha_image(full_screenshot, captcha_elem) -> str:
+    """
+    从全屏截图中裁剪验证码区域，返回 base64 字符串。
+    """
+    x1, y1, x2, y2 = captcha_elem.rect
+    if x2 - x1 <= 0 or y2 - y1 <= 0:
+        return ""
+
+    cropped = full_screenshot.crop((x1, y1, x2, y2))
+    buffered = io.BytesIO()
+    cropped.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode()
+
+
+def _take_captcha_snapshot(captcha_elem):
+    """截图 + 裁剪验证码区域，返回 (img_b64, captcha_elem) 或出错返回 (None, None)。"""
+    try:
+        elems = get_ui_elements_safe(DEVICE_ID)
+        new_captcha = find_captcha_image(elems, DEVICE_ID) or captcha_elem
+        ss = get_screenshot(DEVICE_ID)
+        if ss.is_sensitive:
+            return None, None
+        full = Image.open(io.BytesIO(base64.b64decode(ss.base64_data)))
+        b64 = crop_captcha_image(full, new_captcha)
+        return b64, new_captcha
+    except Exception:
+        return None, None
+
+
+def verify_captcha_with_jfbym() -> bool:
+    """
+    使用云码（jfbym.com）识别安全验证码。
+    流程：获取问题文本 → 截图裁剪验证码区域 → 提交 API → 解析坐标 → 点击
+    每次重试都重新截图 + 刷新验证码，避免同一张图片反复失败。
+    """
+    print("\n[安全验证] 使用云码识别...")
+
+    elements = get_ui_elements_safe(DEVICE_ID)
+
+    # 1. 查找问题文本
+    question_text = find_captcha_question(elements)
+    if question_text:
+        print(f"    问题: {question_text}")
+    else:
+        print("    [WARN] 未找到问题文本，使用空字符串")
+
+    # 2. 查找验证码图片元素
+    captcha_elem = find_captcha_image(elements, DEVICE_ID)
+    if not captcha_elem:
+        print("    [FAIL] 未找到验证码图片 (tcaptcha-img)")
+        return False
+    print(f"    验证码图片: {captcha_elem.bounds}")
+
+    img_x1, img_y1, img_x2, img_y2 = captcha_elem.rect
+
+    # 3. 提交 jfbym API（最多 5 次重试，每次重新截图）
+    for attempt in range(5):
+        print(f"    云码识别尝试 {attempt + 1}/5...")
+
+        # 从第2次开始，先刷新验证码再截图
+        if attempt > 0:
+            print("    刷新验证码图片...")
+            elems_now = get_ui_elements_safe(DEVICE_ID)
+            reload_btn = find_element_by_id("reload", elems_now)
+            if reload_btn:
+                _tap_elem(reload_btn)
+                time.sleep(1.5)
+            else:
+                # 备用：点击验证码图片区域触发刷新
+                tap((img_x1 + img_x2) // 2, (img_y1 + img_y2) // 2, DEVICE_ID)
+                time.sleep(1.5)
+            # 重新获取 captcha_elem
+            fresh_elems = get_ui_elements_safe(DEVICE_ID)
+            fresh_captcha = find_captcha_image(fresh_elems, DEVICE_ID)
+            if fresh_captcha:
+                captcha_elem = fresh_captcha
+                img_x1, img_y1, img_x2, img_y2 = captcha_elem.rect
+
+        # 截图 + 裁剪
+        img_b64, captcha_elem = _take_captcha_snapshot(captcha_elem)
+        if not img_b64:
+            print("    [WARN] 截图/裁剪失败，重试...")
+            time.sleep(1)
+            continue
+
+        try:
+            resp = requests.post(
+                JFBYM_API_URL,
+                json={
+                    "token": JFBYM_TOKEN,
+                    "type": JFBYM_TYPE,
+                    "extra": question_text,
+                    "image": img_b64,
+                },
+                headers={"Content-Type": "application/json"},
+                timeout=15,
+            )
+            raw_text = resp.text[:500]
+            try:
+                result = resp.json()
+            except Exception as json_err:
+                print(f"    [WARN] JSON 解析失败: {json_err}")
+                print(f"    [DEBUG] 原始响应({resp.status_code}): {raw_text}")
+                time.sleep(1)
+                continue
+            msg = result.get("msg", "")
+            code = result.get("code", -1)
+            data = result.get("data", {})
+            print(f"    API: {msg}")
+
+            if code == 10000:
+                coords_str = data.get("data", "")
+                if not coords_str or "," not in coords_str:
+                    print(f"    [WARN] 未解析到坐标: {coords_str}")
+                    continue
+
+                parts = coords_str.split(",")
+                rel_x, rel_y = int(parts[0]), int(parts[1])
+
+                # 计算屏幕实际坐标
+                screen_x = img_x1 + rel_x
+                screen_y = img_y1 + rel_y
+                print(f"    点击 ({screen_x}, {screen_y}) <- 相对({rel_x},{rel_y}) + 图片({img_x1},{img_y1})")
+
+                _tap_xy(screen_x, screen_y)
+                time.sleep(2)
+
+                # 检查验证码是否消失
+                elems_after = get_ui_elements_safe(DEVICE_ID)
+                still_exists = find_element_by_id("tcaptcha-img", elems_after)
+                if not still_exists:
+                    print("    [OK] 验证通过")
+                    return True
+                else:
+                    print("    [WARN] 未通过，下一轮重试...")
+                    continue
+            else:
+                print(f"    [WARN] 识别失败: {msg}")
+                # 识别失败也要刷新图片，继续重试
+                continue
+        except Exception as e:
+            print(f"    [WARN] API 请求异常: {e}")
+            time.sleep(1)
+
+    print("    [FAIL] 验证码识别失败次数过多")
+    return False
+
+
+# ============ 获取验证码 ============
+
+def fetch_sms_code() -> str:
+    """从 API 获取短信验证码。"""
+    print(f"\n[获取验证码] 请求 SMS API...")
+    try:
+        resp = requests.get(SMS_API_URL, timeout=10)
+        data = resp.text.strip()
+        print(f"    API 返回: {data}")
+
+        # 格式1: yes|[TapTap]338016 is your...|(TapTap)|...
+        if data.startswith("yes|"):
+            parts = data.split("|")
+            if len(parts) >= 2:
+                msg = parts[1]
+                m = re.search(r'TapTap\D*(\d{6})', msg)
+                if not m:
+                    m = re.search(r'(?<!\d)(\d{6})(?!\d|\d{2}-\d{2})', msg)
+                if m:
+                    code = m.group(1)
+                    print(f"    [OK] 提取到验证码: {code}")
+                    return code
+
+        # TapTap 验证码固定 6 位数字，排除日期如 2026-07-29
+        m = re.search(r'TapTap\D*(\d{6})', data)
+        if not m:
+            m = re.search(r'(?<!\d)(\d{6})(?!\d|\d{2}-\d{2})', data)
+        if m:
+            code = m.group(1)
+            print(f"    [OK] 提取到验证码: {code}")
+            return code
+
+        print(f"    [WARN] 未找到验证码，原始数据: {data}")
+    except Exception as e:
+        print(f"    [FAIL] API 请求失败: {e}")
+    return ""
+
+
+def wait_for_sms_code(max_wait: int = 60, interval: int = 5) -> str:
+    """等待并获取短信验证码（轮询）。"""
+    print(f"    将在 {max_wait} 秒内轮询获取验证码...")
+    waited = 0
+    while waited < max_wait:
+        code = fetch_sms_code()
+        if code:
+            return code
+        time.sleep(interval)
+        waited += interval
+        print(f"    已等待 {waited} 秒...")
+    return ""
+
+
+# ============ 后台弹窗监控 ============
+
+class PopupMonitor:
+    """后台弹窗监控线程 - 在脚本执行全过程中自动检测并关闭弹窗。
+
+    主线程处理流程步骤的同时，后台线程每隔 interval 秒检测一次常见的弹窗
+    （btn_dismiss、系统权限等），发现即点击关闭，避免弹窗阻塞流程。
+
+    注意：
+    - 「安装弹窗」（TapTap正尝试安装应用）由主线程步骤 [18] 统一处理，
+      后台线程检测到时跳过，避免误点「取消」导致安装中断。
+    - 「更新弹窗」只会弹出一次，处理过后不再重复检测。
+    """
+
+    def __init__(self, device_id: str, interval: float = 2.0):
+        self.device_id = device_id
+        self.interval = interval
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._update_handled = False
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="PopupMonitor")
+        self._thread.start()
+        print(f"    [OK] 弹窗监控已启动（间隔 {self.interval}s）")
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=3)
+        print("    [OK] 弹窗监控已停止")
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            try:
+                self._check_popups()
+            except RuntimeError:
+                pass
+            except Exception:
+                pass
+            self._stop_event.wait(self.interval)
+
+    def _check_popups(self):
+        try:
+            elements = get_ui_elements_safe(self.device_id)
+        except RuntimeError:
+            return
+        if not elements:
+            return
+
+        # ---- 安装弹窗保护检测 ----
+        # 如果页面有「继续」(button3) 说明是 TapTap 安装弹窗，
+        # 后台线程不处理，由主线程步骤[18]统一处理
+        install_popup_active = find_with_multiple_conditions(
+            res_id="android:id/button3", text="继续",
+            clickable=True, elements=elements, device_id=self.device_id
+        ) is not None
+
+        # 1) btn_dismiss 通用关闭按钮
+        dismiss = find_with_multiple_conditions(
+            res_id="com.taptap:id/btn_dismiss", clickable=True,
+            elements=elements, device_id=self.device_id
+        )
+        if dismiss:
+            print(f"    [弹窗监控] → 关闭 btn_dismiss: {_elem_desc(dismiss)}")
+            _tap_elem(dismiss)
+            return
+
+        # 2) 系统权限弹窗（"允许" Button）
+        sys_perm = find_with_multiple_conditions(
+            text="允许", class_name="Button", clickable=True,
+            exact_match=True, elements=elements, device_id=self.device_id
+        )
+        if sys_perm:
+            print("    [弹窗监控] → 系统权限「允许」")
+            _tap_elem(sys_perm)
+            return
+
+        # 3) 更新弹窗（取消/以后再说/稍后/忽略/暂不更新）
+        #    "取消" 需在屏幕下半部分（y>1000），排除顶部导航栏的返回按钮
+        if not self._update_handled and not install_popup_active:
+            for btn_text in ["取消", "以后再说", "稍后", "忽略", "暂不更新"]:
+                btn = find_with_multiple_conditions(
+                    text=btn_text, clickable=True, exact_match=True,
+                    elements=elements, device_id=self.device_id
+                )
+                if btn:
+                    cy = (btn.rect[1] + btn.rect[3]) // 2
+                    if btn_text == "取消" and cy < 800:
+                        continue  # 顶部导航栏按钮，跳过
+                    print(f"    [弹窗监控] → 关闭更新弹窗「{btn_text}」")
+                    _tap_elem(btn)
+                    self._update_handled = True
+                    return
+
+
+# ============ 主流程 ============
+
+def main():
+    log_path = _init_log()
+    _log("=" * 60)
+    _log("TapTap 自动登录脚本")
+    _log(f"日志文件: {log_path}")
+    _log("=" * 60)
+
+    # ---- 启动后台弹窗监控 ----
+    monitor = PopupMonitor(DEVICE_ID, interval=2.0)
+    monitor.start()
+
+    # ---- 第 1 步：清除数据 ----
+    clear_app_data(TAPTAP_PACKAGE)
+
+    # ---- 第 2 步：启动 TapTap ----
+    launch_app_safe("TapTap")
+
+
+    # ---- 第 3 步：隐私政策和权限弹窗 ----
+    _log("\n[3] 处理初始化弹窗（隐私政策 + 权限）...")
+
+    # 跟踪已处理的弹窗类型，避免重复查找
+    handled = {"privacy": False, "permission": False, "update": False}
+
+    for init_attempt in range(8):
+        # 每轮只 dump 一次，所有查找共享
+        try:
+            elements = get_ui_elements_safe(DEVICE_ID)
+        except RuntimeError:
+            time.sleep(2)
+            continue
+        clicked = False
+
+        # 1) 隐私政策/用户协议
+        if not handled["privacy"]:
+            for btn_text in ["同意", "我已阅读并同意", "登录", "下一步"]:
+                elem = find_with_multiple_conditions(
+                    text=btn_text, clickable=True, exact_match=True,
+                    elements=elements, device_id=DEVICE_ID
+                )
+                if elem:
+                    print(f"      → {_elem_desc(elem)}")
+                    _tap_elem(elem)
+                    print(f"    [OK] 点击了「{btn_text}」")
+                    handled["privacy"] = True
+                    clicked = True
+                    time.sleep(0.5)
+                    break
+        if clicked:
+            continue
+
+        # 2) 权限申请
+        if not handled["permission"]:
+            for btn_text in ["始终允许", "允许", "使用期间允许", "使用应用时允许"]:
+                elem = find_with_multiple_conditions(
+                    text=btn_text, clickable=True, exact_match=True,
+                    elements=elements, device_id=DEVICE_ID
+                )
+                if elem:
+                    print(f"      → {_elem_desc(elem)}")
+                    _tap_elem(elem)
+                    print(f"    [OK] 权限弹窗 - 点击了「{btn_text}」")
+                    handled["permission"] = True
+                    clicked = True
+                    time.sleep(0.5)
+                    break
+        if clicked:
+            continue
+
+        # 3) 系统权限弹窗
+        if not handled["permission"]:
+            system_perm = find_with_multiple_conditions(
+                text="允许", class_name="Button", clickable=True,
+                exact_match=True, elements=elements, device_id=DEVICE_ID
+            )
+            if system_perm:
+                print(f"      → {_elem_desc(system_perm)}")
+                _tap_elem(system_perm)
+                print("    [OK] 点击了系统权限「允许」")
+                handled["permission"] = True
+                time.sleep(5.5)
+                continue
+
+        # 4) 更新弹窗（每轮都要检测，可能随时弹出）
+        for btn_text in ["取消", "以后再说", "稍后", "忽略", "暂不更新"]:
+            elem = find_with_multiple_conditions(
+                text=btn_text, clickable=True, exact_match=True,
+                elements=elements, device_id=DEVICE_ID
+            )
+            if elem:
+                print(f"      → {_elem_desc(elem)}")
+                _tap_elem(elem)
+                print(f"    [OK] 更新弹窗 - 点击了「{btn_text}」")
+                handled["update"] = True
+                clicked = True
+                time.sleep(0.5)
+                break
+        if not clicked:
+            btn_dismiss = find_with_multiple_conditions(
+                res_id="com.taptap:id/btn_dismiss", clickable=True,
+                elements=elements, device_id=DEVICE_ID
+            )
+            if btn_dismiss:
+                print(f"      → {_elem_desc(btn_dismiss)}")
+                _tap_elem(btn_dismiss)
+                handled["update"] = True
+                clicked = True
+                time.sleep(0.5)
+        if clicked:
+            continue
+
+        # 没有需要处理的弹窗了
+        print(f"    - 弹窗处理完毕（第 {init_attempt + 1} 轮后无更多弹窗）")
+        break
+    else:
+        print("    - 达到最大处理轮数，继续后续流程")
+
+    time.sleep(1)
+
+    # ---- 第 5 步：返回主页，点击头像进入登录 ----
+    _log("\n[5] 导航到登录页...")
+
+    # 检查是否在主页：查找底部导航栏 tb_layout_home_bottom_bar
+    home_elems = get_ui_elements_safe(DEVICE_ID)
+    home_tab = find_element_by_id("com.taptap:id/tb_layout_home_bottom_bar", home_elems)
+    if not home_tab:
+        print("    [WARN] 不在主页，按返回键回到主页...")
+        back(DEVICE_ID)
+        time.sleep(1)
+    else:
+        print("    [OK] 已在主页")
+
+    # 循环：弹窗检测 + 头像查找合并在一起，失败自动重试
+    avatar_found = False
+    for attempt in range(12):
+        try:
+            elems = get_ui_elements_safe(DEVICE_ID)
+        except RuntimeError:
+            time.sleep(1)
+            continue
+
+        # 1) 检查是否有弹窗挡住（更新弹窗、评分弹窗等）
+        popup_dismissed = False
+
+        dismiss = find_with_multiple_conditions(
+            res_id="com.taptap:id/btn_dismiss", clickable=True,
+            elements=elems, device_id=DEVICE_ID
+        )
+        if dismiss:
+            print(f"    发现弹窗: {_elem_desc(dismiss)}")
+            _tap_elem(dismiss)
+            time.sleep(0.5)
+            continue
+
+        cancel = find_with_multiple_conditions(
+            text="取消", clickable=True, exact_match=True,
+            elements=elems, device_id=DEVICE_ID
+        )
+        if cancel:
+            print(f"    发现弹窗: {_elem_desc(cancel)}")
+            _tap_elem(cancel)
+            time.sleep(0.5)
+            continue
+
+        for t in ["以后再说", "忽略", "稍后"]:
+            c = find_with_multiple_conditions(
+                text=t, clickable=True, exact_match=True,
+                elements=elems, device_id=DEVICE_ID
+            )
+            if c:
+                print(f"    发现弹窗: {_elem_desc(c)}")
+                _tap_elem(c)
+                time.sleep(0.5)
+                popup_dismissed = True
+                break
+        if popup_dismissed:
+            continue
+
+        # 2) 没弹窗，找头像
+        avatar_elem = find_element_by_id("com.taptap:id/viewHeader", elems)
+        if not avatar_elem:
+            avatar_elem = find_element_by_desc("头像", elems, exact_match=False)
+        if not avatar_elem:
+            screen_width = 1080
+            right_x = int(screen_width * 0.9)
+            right_top = find_elements_by_bounds(right_x - 100, 0, right_x + 100, 200, elems)
+            for e in right_top:
+                if e.clickable and e.class_name and 'Image' in e.class_name:
+                    avatar_elem = e
+                    break
+
+        if avatar_elem:
+            print(f"    找到头像: {_elem_desc(avatar_elem)}")
+            _tap_elem(avatar_elem)
+            time.sleep(2)
+            avatar_found = True
+            print("    [OK] 已点击头像")
+            break
+
+        # 3) 没弹窗也没头像 → 可能不在主页，按返回重试
+        if attempt < 4:
+            print(f"    [WARN] 第{attempt+1}次未找到头像，按返回重试...")
+            back(DEVICE_ID)
+            time.sleep(1)
+        else:
+            print(f"    [WARN] 第{attempt+1}次未找到头像，尝试在右上角区域点击...")
+            _tap_xy(1000, 100)
+            time.sleep(1.5)
+
+    if not avatar_found:
+        _log("    [WARN] 多次重试后仍未找到头像，继续后续步骤...")
+
+    # ---- 第 6 步：切换国家/地区 ----
+    _log("\n[6] 切换国家到美国...")
+
+    # 当前界面显示 "CN+86"（clickable），点击进入国家列表
+    time.sleep(1)
+    if find_and_tap_safe(res_id="com.taptap:id/tv_area_code", clickable=True, retries=3):
+        print("    [OK] 已点击国家切换按钮")
+    elif find_and_tap_safe(text="CN+86", clickable=True, retries=3):
+        print("    [OK] 已点击当前国家代码")
+    elif find_and_tap_safe(text="+86", clickable=True, retries=3):
+        print("    [OK] 已点击国家代码")
+    elif find_and_tap_safe(desc="国家", clickable=True, retries=3):
+        print("    [OK] 已点击国家切换")
+    elif find_and_tap_safe(text="+1", clickable=True, retries=3):
+        print("    [OK] 已点击国家代码")
+    elif find_and_tap_safe(text="中国", clickable=True, retries=3):
+        print("    [OK] 已点击当前国家")
+    elif find_and_tap_safe(desc="country", clickable=True, retries=3):
+        print("    [OK] 已点击国家选择")
+    else:
+        # 尝试找输入框旁边的可点击元素
+        print("    [WARN] 尝试查找国家切换按钮...")
+        elements = get_ui_elements_safe(DEVICE_ID)
+        edit_texts = [e for e in elements if 'EditText' in e.class_name]
+        if edit_texts:
+            input_elem = edit_texts[0]
+            x1, y1, x2, y2 = input_elem.rect
+            left_x = max(0, x1 - 100)
+            left_y = (y1 + y2) // 2
+            print(f"      → 点击输入框左侧: {_elem_desc(input_elem)}")
+            _tap_xy(left_x, left_y)
+            time.sleep(1)
+            print(f"    [OK] 点击了输入框左侧 ({left_x}, {left_y})")
+
+    time.sleep(2)
+
+    # 在国家列表中下滑并选择美国
+    print("    搜索「United States」...")
+    found = False
+    for scroll_attempt in range(10):
+        elements = get_ui_elements_safe(DEVICE_ID)
+        us_elem = find_element_by_text("United States", elements, exact_match=False)
+        if not us_elem:
+            us_elem = find_element_by_text("美国", elements, exact_match=False)
+        if not us_elem:
+            us_elem = find_element_by_desc("United States", elements, exact_match=False)
+
+        if us_elem and us_elem.clickable and us_elem.enabled:
+            _tap_elem(us_elem)
+            time.sleep(1)
+            print(f"    [OK] 已选择 United States")
+            found = True
+            break
+        elif us_elem:
+            _tap_elem(us_elem)
+            time.sleep(1)
+            print("    [OK] 已点击 United States")
+            found = True
+            break
+
+        if not found:
+            scroll_down_in_list()
+            time.sleep(0.8)
+
+    if not found:
+        print("    [WARN] 未找到 United States，尝试直接输入查找...")
+        find_and_tap_safe(class_name="EditText", clickable=True, retries=3)
+        time.sleep(0.5)
+        original_ime = detect_and_set_adb_keyboard(DEVICE_ID)
+        time.sleep(0.5)
+        clear_text(DEVICE_ID)
+        time.sleep(0.3)
+        type_text("United States", DEVICE_ID)
+        time.sleep(1)
+        restore_keyboard(original_ime, DEVICE_ID)
+        time.sleep(1)
+        if find_and_tap_safe(text="United States", retries=5):
+            print("    [OK] 通过搜索选择了 United States")
+            found = True
+
+    time.sleep(1)
+
+    # ---- 第 7 步：输入手机号 ----
+    print(f"\n[7] 输入手机号 {PHONE_NUMBER}...")
+
+    elements = get_ui_elements_safe(DEVICE_ID)
+    input_elem = find_text_input_elements(elements)
+    if input_elem:
+        _log(f"      → 点击输入框: {_elem_desc(input_elem[0])}")
+        _tap_elem(input_elem[0])
+        time.sleep(0.5)
+
+    original_ime = detect_and_set_adb_keyboard(DEVICE_ID)
+    time.sleep(0.5)
+    clear_text(DEVICE_ID)
+    time.sleep(0.3)
+    type_text(PHONE_NUMBER, DEVICE_ID)
+    time.sleep(1)
+    restore_keyboard(original_ime, DEVICE_ID)
+    time.sleep(1)
+    print("    [OK] 手机号已输入")
+
+    # 收起键盘，避免挡住登录按钮
+    print("    [INFO] 收起键盘...")
+    adb_cmd("shell", "input", "keyevent", "4")
+    time.sleep(1)
+    # 再点一下输入框外的空白区域确保键盘完全收起
+    _tap_xy(500, 500)
+    time.sleep(0.5)
+
+    # ---- 第 8 步：跳过勾选协议，直接点击登录 ----
+    # 不勾选协议，点击登录后会弹出服务协议和隐私政策对话框
+    print("\n[8] 点击登录（不勾选协议，等待弹窗）...")
+    login_clicked = find_and_tap_safe(text="登录", clickable=True, retries=5)
+    if login_clicked:
+        print("    [OK] 已点击登录")
+    else:
+        print("    [WARN] 尝试其他方式...")
+        if find_and_tap_safe(desc="登录", clickable=True, retries=3):
+            print("    [OK] 已点击登录（通过 desc）")
+        else:
+            print("    [FAIL] 未找到登录按钮")
+            return
+
+    time.sleep(1.5)
+
+    # ---- 第 9 步：处理服务协议和隐私政策弹窗 ----
+    print("\n[9] 处理服务协议和隐私政策弹窗...")
+    consent_found = False
+    for attempt in range(10):
+        try:
+            elems = get_ui_elements_safe(DEVICE_ID)
+        except RuntimeError:
+            time.sleep(0.5)
+            continue
+
+        consent = find_with_multiple_conditions(
+            text="同意并继续", clickable=True, exact_match=True,
+            elements=elems, device_id=DEVICE_ID
+        )
+        if not consent:
+            consent = find_with_multiple_conditions(
+                res_id="com.taptap:id/dialog_btn_right", clickable=True,
+                elements=elems, device_id=DEVICE_ID
+            )
+        if not consent:
+            consent = find_with_multiple_conditions(
+                res_id="com.taptap:id/btn_agree", clickable=True,
+                elements=elems, device_id=DEVICE_ID
+            )
+        if not consent:
+            consent = find_with_multiple_conditions(
+                text="同意", clickable=True, exact_match=True,
+                elements=elems, device_id=DEVICE_ID
+            )
+
+        if consent:
+            print(f"    找到同意按钮: {_elem_desc(consent)}")
+            _tap_elem(consent)
+            time.sleep(1)
+            consent_found = True
+            print("    [OK] 已点击「同意并继续」")
+            break
+
+        time.sleep(0.5)
+
+    if not consent_found:
+        print("    [WARN] 未找到「同意并继续」按钮，可能已默认同意或未弹出")
+
+    time.sleep(20)
+    print("\n[9.5] 检查是否有安全验证...")
+    elements = get_ui_elements_safe(DEVICE_ID)
+    # 等待10秒
+
+    has_captcha = find_element_by_id("tcaptcha-img", elements) is not None
+    security_texts = [e.text for e in elements if e.text and any(
+        kw in e.text for kw in ["验证", "安全", "captcha", "CAPTCHA", "滑块","安全验证"]
+    )]
+    if has_captcha or security_texts:
+        if security_texts:
+            print(f"    发现安全验证: {security_texts}")
+        else:
+            print("    发现安全验证 (tcaptcha-img)")
+        if not verify_captcha_with_jfbym():
+            print("    [WARN] 云码识别未完成，尝试重新验证...")
+            # 再试一轮（刷新验证码重新识别）
+            if not verify_captcha_with_jfbym():
+                print("    [FAIL] 云码识别多次失败，继续后续流程...")
+    else:
+        print("    - 无安全验证，直接进入登录流程")
+
+    time.sleep(2)
+
+    # ---- 第 10 步：获取并输入短信验证码 ----
+    print("\n[10] 获取短信验证码...")
+    code = wait_for_sms_code(max_wait=120, interval=5)
+
+    if not code:
+        print("    [FAIL] 未能获取验证码")
+        return
+
+    print(f"\n[11] 输入验证码: {code}...")
+
+    # 找验证码输入框
+    elements = get_ui_elements_safe(DEVICE_ID)
+    code_inputs = [e for e in elements if 'EditText' in e.class_name]
+    if code_inputs:
+        _tap_elem(code_inputs[0])
+        time.sleep(0.5)
+
+    original_ime = detect_and_set_adb_keyboard(DEVICE_ID)
+    time.sleep(0.5)
+    clear_text(DEVICE_ID)
+    time.sleep(0.3)
+    type_text(code, DEVICE_ID)
+    time.sleep(0.5)
+    restore_keyboard(original_ime, DEVICE_ID)
+    print(f"    [OK] 验证码已输入: {code}")
+
+    time.sleep(2)
+
+    # 确认/提交验证码
+    print("\n[12] 提交验证码...")
+    # 查找并点击提交按钮（确认/确定/下一步/提交）
+    submitted = False
+    for submit_attempt in range(8):
+        time.sleep(0.8)
+        elements = get_ui_elements_safe(DEVICE_ID)
+        for btn_text in ["确认", "确定", "下一步", "提交", "登录"]:
+            btn = find_with_multiple_conditions(
+                text=btn_text, clickable=True, exact_match=True,
+                elements=elements, device_id=DEVICE_ID
+            )
+            if btn and btn.rect[3] > 1800:  # 底部按钮
+                print(f"    [OK] 点击「{btn_text}」提交验证码")
+                _tap_elem(btn)
+                submitted = True
+                time.sleep(2)
+                break
+        if submitted:
+            break
+        # 检查是否已跳转到用户名/主页
+        for e in elements:
+            if e.resource_id and ("tv_user_name" in e.resource_id or "tb_layout_home" in e.resource_id):
+                print("    - 验证码已自动提交，进入后续页面")
+                submitted = True
+                break
+        if submitted:
+            break
+
+    if not submitted:
+        print("    [WARN] 未找到提交按钮，可能已自动提交")
+
+    time.sleep(2)
+
+    # ============================================================
+    # 后续操作：新账号用户名 → 搜索游戏 → 下载 → 安装 → 启动
+    # ============================================================
+
+    # ---- 第 13 步：处理新账号用户名填写 ----
+    print("\n[13] 检查用户名填写页面...")
+    username_done = False
+    for attempt in range(15):
+        time.sleep(1.5)
+        elements = get_ui_elements_safe(DEVICE_ID)
+
+        done_btn = find_with_multiple_conditions(
+            text="完成", clickable=True, elements=elements, device_id=DEVICE_ID
+        )
+        if done_btn:
+            print("    发现「完成」按钮，已在用户名页面")
+            username_done = True
+            break
+
+        # 也检测其他可能的确认按钮文本
+        for bt in ["确定", "确认", "提交", "下一步"]:
+            done_btn = find_with_multiple_conditions(
+                text=bt, clickable=True, exact_match=True,
+                elements=elements, device_id=DEVICE_ID
+            )
+            if done_btn and done_btn.rect[3] > 1800:
+                print(f"    发现「{bt}」按钮，已在用户名页面")
+                username_done = True
+                break
+        if username_done:
+            break
+
+        if find_element_by_id("com.taptap:id/tv_user_name", elements):
+            print("    [OK] 已在个人主页页面")
+            break
+        if find_element_by_id("com.taptap:id/tb_layout_home_bottom_bar", elements):
+            print("    [OK] 已直接到主页，跳过用户名填写")
+            break
+
+        # 检测是否有输入框 = 用户名填写页
+        inputs = find_text_input_elements(elements)
+        if inputs:
+            for e in elements:
+                if e.text and ("用户名" in e.text or "昵称" in e.text or "取个名字" in e.text):
+                    print("    [OK] 检测到用户名填写页面")
+                    username_done = True
+                    break
+        if username_done:
+            break
+
+        if attempt == 0:
+            print("    - 等待页面跳转...")
+
+    if not username_done:
+        print("    [WARN] 未能确认用户名页面")
+    else:
+        # 查找输入框填入随机用户名
+        elements = get_ui_elements_safe(DEVICE_ID)
+        input_elems = find_text_input_elements(elements)
+        if input_elems:
+            print("    生成随机用户名...")
+            _tap_elem(input_elems[0])
+            time.sleep(0.5)
+            original_ime = detect_and_set_adb_keyboard(DEVICE_ID)
+            time.sleep(0.5)
+            clear_text(DEVICE_ID)
+            time.sleep(0.3)
+            random_name = "用户" + str(random.randint(10000, 99999))
+            type_text(random_name, DEVICE_ID)
+            time.sleep(1)
+            restore_keyboard(original_ime, DEVICE_ID)
+            print(f"    [OK] 已输入用户名: {random_name}")
+
+        time.sleep(1)
+        if find_and_tap_safe(text="完成", clickable=True, retries=8):
+            print("    [OK] 已点击完成")
+        else:
+            print("    [WARN] 未找到「完成」按钮")
+
+    time.sleep(2)
+
+    # ---- 第 14 步：回到主页并点击搜索栏 ----
+    print("\n[14] 回到主页...")
+    for attempt in range(15):
+        time.sleep(1)
+        elements = get_ui_elements_safe(DEVICE_ID)
+
+        # 多条件检测是否已在主页
+        is_home = False
+        home_indicators = [
+            "com.taptap:id/tb_layout_home_bottom_bar",
+            "com.taptap:id/viewSearchContent",
+            "com.taptap:id/tsi_search_banner_key_text",
+        ]
+        for rid in home_indicators:
+            if find_element_by_id(rid, elements):
+                is_home = True
+                break
+        if not is_home:
+            bottom_bar = find_with_multiple_conditions(
+                text="找游戏", elements=elements, device_id=DEVICE_ID
+            )
+            if bottom_bar:
+                is_home = True
+        if not is_home:
+            for text_keyword in ["找游戏", "排行榜", "我的游戏"]:
+                if find_with_multiple_conditions(text=text_keyword, elements=elements, device_id=DEVICE_ID):
+                    is_home = True
+                    break
+
+        if is_home:
+            print("    [OK] 已在主页")
+            break
+
+        dismiss = find_element_by_id("com.taptap:id/btn_dismiss", elements)
+        if dismiss:
+            _tap_elem(dismiss)
+            time.sleep(1)
+            continue
+
+        container = find_element_by_id("com.taptap:id/btn_container", elements)
+        if container:
+            _tap_elem(container)
+            time.sleep(1)
+            continue
+
+        back(DEVICE_ID)
+        time.sleep(1)
+
+    print("    点击搜索栏...")
+    # search_clicked = find_and_tap_safe(
+    #     res_id="com.taptap:id/tsi_search_banner_key_text", clickable=True, retries=5
+    # )
+    # if not search_clicked:
+    #     search_clicked = find_and_tap_safe(
+    #         res_id="com.taptap:id/tvSearchKey", clickable=True, retries=5
+    #     )
+    # if not search_clicked:
+    search_clicked = find_and_tap_safe(
+        res_id="com.taptap:id/viewSearchContent", clickable=True, retries=5
+    )
+    if search_clicked:
+        print("    [OK] 已点击搜索栏")
+    else:
+        print("    [WARN] 未找到搜索栏")
+
+    time.sleep(1)
+
+    # ---- 第 15 步：搜索游戏 ----
+    print(f"\n[15] 搜索游戏「{GAME_NAME}」...")
+
+    # input_clicked = find_and_tap_safe(
+    #     res_id="com.taptap:id/input_box", clickable=True, retries=5
+    # )
+    # if input_clicked:
+    #     time.sleep(0.5)
+    #     original_ime = detect_and_set_adb_keyboard(DEVICE_ID)
+    #     time.sleep(0.5)
+    #     clear_text(DEVICE_ID)
+    #     time.sleep(0.3)
+    #     type_text(GAME_NAME, DEVICE_ID)
+    #     time.sleep(1)
+    #     restore_keyboard(original_ime, DEVICE_ID)
+    #     print("    [OK] 已输入搜索词")
+    # else:
+    print("    [WARN] 未找到输入框，尝试备用方式...")
+    elements = get_ui_elements_safe(DEVICE_ID)
+    inputs = find_text_input_elements(elements)
+    if inputs:
+        _tap_elem(inputs[0])
+        time.sleep(0.5)
+        original_ime = detect_and_set_adb_keyboard(DEVICE_ID)
+        time.sleep(0.5)
+        type_text(GAME_NAME, DEVICE_ID)
+        time.sleep(1)
+        restore_keyboard(original_ime, DEVICE_ID)
+    else:
+        print("    [FAIL] 无法输入搜索词")
+        return
+
+    time.sleep(1)
+    print("    点击搜索按钮...")
+    search_btn = find_and_tap_safe(
+        text="搜索", clickable=True, retries=5
+    )
+    if not search_btn:
+        search_btn = find_and_tap_safe(
+            res_id="com.taptap:id/tvSure", clickable=True, retries=5
+        )
+    if not search_btn:
+        adb_cmd("shell", "input", "keyevent", "66")
+        time.sleep(2)
+
+    if search_btn:
+        print("    [OK] 已执行搜索")
+    else:
+        print("    [WARN] 搜索按钮未找到，尝试回车")
+
+    time.sleep(2)
+
+    # ---- 第 16 步：选择游戏 ----
+    print(f"\n[16] 选择游戏「{GAME_NAME}」...")
+    game_clicked = False
+
+    # 1) 搜索完成后，过滤掉输入框本身，只找结果列表中的游戏名
+    elements = get_ui_elements_safe(DEVICE_ID)
+    # 排除输入框（搜索栏里的文字）
+    candidates = [
+        e for e in elements
+        if not (e.class_name and "EditText" in e.class_name)
+        and (e.resource_id and "title" in e.resource_id.lower())
+    ]
+    if not candidates:
+        candidates = [
+            e for e in elements
+            if not (e.class_name and "EditText" in e.class_name)
+        ]
+    matches = find_elements_by_text(GAME_NAME, candidates, exact_match=False)
+    if matches:
+        title_elem = matches[0]
+        cx = (title_elem.rect[0] + title_elem.rect[2]) // 2
+        cy = (title_elem.rect[1] + title_elem.rect[3]) // 2
+        print(f"    [OK] 找到「{GAME_NAME}」({cx},{cy})，点击中心")
+        _tap_xy(cx, cy)
+        time.sleep(1.5)
+        game_clicked = True
+
+    # 2) 备选：找 brand_app
+    if not game_clicked:
+        game_clicked = find_and_tap_safe(
+            res_id="com.taptap:id/brand_app", clickable=True, retries=5, delay=1.5
+        )
+
+    # 3) 再备选：找第一个游戏结果项
+    if not game_clicked:
+        print("    [WARN] 未找到品牌游戏，尝试点击第一个游戏结果...")
+        for e in elements:
+            if ("brand" in (e.resource_id or "").lower()
+                    or "title" in (e.resource_id or "").lower()
+                    or "item" in (e.resource_id or "").lower()):
+                if e.clickable:
+                    _tap_elem(e)
+                    time.sleep(1.5)
+                    game_clicked = True
+                    break
+        if not game_clicked:
+            # 最后尝试：找 bounds 大的 ViewGroup
+            for e in sorted(elements, key=lambda x: (x.rect[2]-x.rect[0])*(x.rect[3]-x.rect[1]), reverse=True):
+                if e.class_name and "ViewGroup" in e.class_name and e.clickable:
+                    _tap_elem(e)
+                    time.sleep(1.5)
+                    game_clicked = True
+                    break
+
+    if not game_clicked:
+        print("    [FAIL] 未找到游戏结果")
+        return
+
+    print("    [OK] 已进入游戏详情页")
+    time.sleep(2)
+
+    # ---- 第 17 步：点击下载 ----
+    print("\n[17] 点击下载...")
+    download_clicked = False
+
+    # 1) 页面底部可能有多个"下载"文本，取最底部的（真正的下载按钮在底部）
+    elements = get_ui_elements_safe(DEVICE_ID)
+    download_texts = find_elements_by_text("下载", elements, exact_match=False)
+    text_elem = None
+    if download_texts:
+        text_elem = max(download_texts, key=lambda e: e.rect[3])
+        tx, ty = (text_elem.rect[0] + text_elem.rect[2]) // 2, (text_elem.rect[1] + text_elem.rect[3]) // 2
+        # 向上找可点击的父容器（优先找 btn_container）
+        for e in elements:
+            if e.clickable and e.rect[0] <= tx <= e.rect[2] and e.rect[1] <= ty <= e.rect[3]:
+                if "btn_container" in (e.resource_id or ""):
+                    _tap_elem(e)
+                    download_clicked = True
+                    print(f"    [OK] 点击「下载」按钮 (btn_container)")
+                    break
+        if not download_clicked:
+            for e in elements:
+                if e.clickable and e.rect[0] <= tx <= e.rect[2] and e.rect[1] <= ty <= e.rect[3]:
+                    _tap_elem(e)
+                    download_clicked = True
+                    print(f"    [OK] 点击「下载」文本的可点击父容器 ({e.resource_id or e.class_name})")
+                    break
+
+    # 2) 备选：btn_container
+    if not download_clicked:
+        download_clicked = find_and_tap_safe(
+            res_id="com.taptap:id/btn_container", clickable=True, retries=5
+        )
+
+    if download_clicked:
+        print("    [OK] 已触发下载")
+    else:
+        print("    [FAIL] 未找到下载按钮")
+        return
+
+    time.sleep(2)
+    print("\n[18] 监控下载进度 & 处理安装弹窗...")
+    download_complete = False
+    installed = False
+
+    for check_round in range(240):
+        time.sleep(1.5)
+        try:
+            elements = get_ui_elements_safe(DEVICE_ID)
+        except RuntimeError:
+            continue
+
+        # ==== A) 检查下载状态 ====
+        # 只在未完成下载时检测下载进度
+        if not download_complete:
+            btn_container = find_with_multiple_conditions(
+                res_id="com.taptap:id/btn_container", elements=elements, device_id=DEVICE_ID
+            )
+            if btn_container:
+                any_install_text = find_all_with_multiple_conditions(
+                    text="安装", exact_match=False,
+                    elements=elements, device_id=DEVICE_ID
+                )
+                if any_install_text:
+                    print(f"    [OK] 下载完成，检测到「安装」文本")
+                    download_complete = True
+                elif check_round % 20 == 0:
+                    any_download_text = find_with_multiple_conditions(
+                        text="下载", exact_match=False,
+                        elements=elements, device_id=DEVICE_ID
+                    )
+                    if any_download_text:
+                        print(f"    下载中... (btn_container 存在，文本: {any_download_text.text})")
+                    else:
+                        print(f"    下载中... (btn_container 存在)")
+            else:
+                any_install_text = find_all_with_multiple_conditions(
+                    text="安装", exact_match=False,
+                    elements=elements, device_id=DEVICE_ID
+                )
+                if any_install_text:
+                    print(f"    [OK] 检测到「安装」文本，下载完成")
+                    download_complete = True
+                elif check_round % 20 == 0:
+                    print(f"    等待下载按钮出现... (round {check_round})")
+
+            # 仍在下载中（进度提示）
+            if check_round % 20 == 0 and not download_complete:
+                progress_texts = [e.text for e in elements if e.text and any(
+                    kw in e.text for kw in ["下载", "MB", "KB", "%"]
+                )]
+                if progress_texts:
+                    print(f"    下载中... {progress_texts[:2]}")
+        else:
+            if check_round % 20 == 0:
+                print(f"    安装处理中... (已等待 {(check_round+1)*1.5:.0f}s)")
+
+        # ==== B) 同时检测 MIUI 安装弹窗（下载过程中随时可能出现） ====
+        # 弹窗1: "TapTap正尝试安装应用" → "继续"
+        continue_btn = find_with_multiple_conditions(
+            res_id="android:id/button3", text="继续",
+            clickable=True, elements=elements, device_id=DEVICE_ID
+        )
+        if continue_btn:
+            print("    [OK] 发现「TapTap正尝试安装应用」弹窗，点击继续")
+            _tap_elem(continue_btn)
+            time.sleep(1)
+            continue
+
+        # 弹窗2: "是否允许TapTap安装应用？" → "允许"
+        allow_btn = find_with_multiple_conditions(
+            res_id="android:id/button2", text="允许",
+            clickable=True, elements=elements, device_id=DEVICE_ID
+        )
+        if allow_btn:
+            print("    [OK] 发现「是否允许安装」弹窗，点击允许")
+            _tap_elem(allow_btn)
+            time.sleep(1)
+            continue
+
+        # 弹窗2b: "TapTap频繁安装应用" → 点"验证"
+        verify_title = find_with_multiple_conditions(
+            text="TapTap频繁安装应用", exact_match=False,
+            elements=elements, device_id=DEVICE_ID
+        )
+        if verify_title:
+            verify_btn = find_with_multiple_conditions(
+                text="验证", clickable=True, exact_match=False,
+                elements=elements, device_id=DEVICE_ID
+            )
+            if verify_btn:
+                print("    [OK] 发现「TapTap频繁安装应用」弹窗，点击验证")
+                _tap_elem(verify_btn)
+                time.sleep(2)
+                continue
+            # 找不到按钮就点 title 区域下方（弹窗右下角）
+            print("    [OK] 点击「验证」位置")
+            _tap_xy(720, 2501)
+            time.sleep(2)
+            continue
+
+        # 弹窗2c: 拖动滑块验证（WebView 内嵌）
+        slider_text = find_with_multiple_conditions(
+            text="拖动滑块完成拼图", exact_match=False,
+            elements=elements, device_id=DEVICE_ID
+        )
+        if slider_text:
+            # 找实际的滑块把手：文字左侧/附近的窄 TextView（无文本、可点击）
+            slider_btn = None
+            for e in elements:
+                if (not e.text and e.clickable
+                        and e.class_name and "TextView" in e.class_name
+                        and e.rect[1] >= slider_text.rect[1] - 200
+                        and e.rect[3] <= slider_text.rect[3] + 200
+                        and (e.rect[2] - e.rect[0]) < 350
+                        and e.rect[2] < slider_text.rect[0] + 50):
+                    slider_btn = e
+                    break
+
+            if slider_btn:
+                sx = (slider_btn.rect[0] + slider_btn.rect[2]) // 2
+                sy = (slider_btn.rect[1] + slider_btn.rect[3]) // 2
+            else:
+                sx = slider_text.rect[0] + 115
+                sy = (slider_text.rect[1] + slider_text.rect[3]) // 2
+
+            ex = sx + 700
+            print(f"    [OK] 滑块验证: 把手={_elem_desc(slider_btn) if slider_btn else 'fallback'} 拖动 ({sx},{sy}) → ({ex},{sy})")
+            # WebView 滑块需要用 touch motionevent 模拟真实手指拖动
+            _swipe_slider(sx, sy, ex, sy)
+            time.sleep(2)
+            continue
+
+        # 弹窗3: MIUI / HyperOS 安装确认页
+        # 先试 checkbox（勾选"已了解此安装包未经安全检测"）
+        checkbox = (
+            find_with_multiple_conditions(
+                res_id="checkbox", exact_match=False,
+                elements=elements, device_id=DEVICE_ID
+            )
+            or find_with_multiple_conditions(
+                res_id="miui.packageinstaller:id/checkbox", exact_match=False,
+                elements=elements, device_id=DEVICE_ID
+            )
+            or find_with_multiple_conditions(
+                res_id="android:id/checkbox", exact_match=False,
+                elements=elements, device_id=DEVICE_ID
+            )
+            or find_with_multiple_conditions(
+                class_name="CheckBox", checkable=True,
+                elements=elements, device_id=DEVICE_ID
+            )
+        )
+        if checkbox:
+            # 勾选 checkbox（每次点一下确保选中）
+            print("    [OK] 勾选「已了解此安装包未经安全检测」")
+            _tap_elem(checkbox)
+            time.sleep(0.3)
+
+        # 找"继续安装" / "安装" / "确定" / "完成" 按钮
+        install_btn = (
+            find_with_multiple_conditions(
+                text="完成", clickable=True, exact_match=False,
+                elements=elements, device_id=DEVICE_ID
+            )
+            or find_with_multiple_conditions(
+                text="完成", exact_match=False,
+                elements=elements, device_id=DEVICE_ID
+            )
+            or find_with_multiple_conditions(
+                text="继续安装", clickable=True, exact_match=False,
+                elements=elements, device_id=DEVICE_ID
+            )
+            or find_with_multiple_conditions(
+                text="继续安装", exact_match=False,
+                elements=elements, device_id=DEVICE_ID
+            )
+            or find_with_multiple_conditions(
+                text="安装", clickable=True, exact_match=False,
+                elements=elements, device_id=DEVICE_ID
+            )
+            or find_with_multiple_conditions(
+                text="确定", clickable=True, exact_match=False,
+                elements=elements, device_id=DEVICE_ID
+            )
+        )
+        if install_btn and install_btn.rect[3] > 2000:
+            btn_text = install_btn.text or ""
+            print(f"    [OK] 点击「{btn_text}」")
+            _tap_elem(install_btn)
+            time.sleep(1)
+            if "完成" in btn_text:
+                installed = True
+                print("    [OK] 安装完成！")
+                break
+            continue
+
+        # 如果只找到 checkbox 没找到按钮，继续循环
+        if checkbox:
+            continue
+
+        # ==== C) 检查安装完成后是否回到 TapTap 主页 ====
+        home_tab = find_element_by_id(
+            "com.taptap:id/tb_layout_home_bottom_bar", elements
+        )
+        if home_tab:
+            installed = True
+            print("    [OK] 安装完成，已回到 TapTap 主页")
+            break
+
+        if check_round % 30 == 29:
+            print(f"    等待中... (已等待 {(check_round+1)*1.5:.0f}s)")
+
+    if not download_complete:
+        print("    [WARN] 下载可能未完成，继续处理安装...")
+    if not installed:
+        print("    [WARN] 安装可能未完成，尝试继续处理安装弹窗...")
+        # 循环结束后额外尝试一次处理安装弹窗
+        for _ in range(40):
+            try:
+                elems_now = get_ui_elements_safe(DEVICE_ID)
+            except RuntimeError:
+                time.sleep(1)
+                continue
+            handled = False
+
+            continue_btn = find_with_multiple_conditions(
+                res_id="android:id/button3", text="继续",
+                clickable=True, elements=elems_now, device_id=DEVICE_ID
+            )
+            if continue_btn:
+                print("    [OK] 发现「TapTap正尝试安装应用」弹窗，点击继续")
+                _tap_elem(continue_btn)
+                time.sleep(1)
+                handled = True
+
+            allow_btn = find_with_multiple_conditions(
+                res_id="android:id/button2", text="允许",
+                clickable=True, elements=elems_now, device_id=DEVICE_ID
+            )
+            if allow_btn:
+                print("    [OK] 发现「是否允许安装」弹窗，点击允许")
+                _tap_elem(allow_btn)
+                time.sleep(1)
+                handled = True
+
+            verify_title = find_with_multiple_conditions(
+                text="TapTap频繁安装应用", exact_match=False,
+                elements=elems_now, device_id=DEVICE_ID
+            )
+            if verify_title:
+                verify_btn = find_with_multiple_conditions(
+                    text="验证", clickable=True, exact_match=False,
+                    elements=elems_now, device_id=DEVICE_ID
+                )
+                if verify_btn:
+                    print("    [OK] 点击验证")
+                    _tap_elem(verify_btn)
+                    time.sleep(2)
+                    handled = True
+                else:
+                    _tap_xy(720, 2501)
+                    time.sleep(2)
+                    handled = True
+
+            slider_text = find_with_multiple_conditions(
+                text="拖动滑块完成拼图", exact_match=False,
+                elements=elems_now, device_id=DEVICE_ID
+            )
+            if slider_text:
+                slider_btn = None
+                for e in elems_now:
+                    if (not e.text and e.clickable
+                            and e.class_name and "TextView" in e.class_name
+                            and e.rect[1] >= slider_text.rect[1] - 200
+                            and e.rect[3] <= slider_text.rect[3] + 200
+                            and (e.rect[2] - e.rect[0]) < 350
+                            and e.rect[2] < slider_text.rect[0] + 50):
+                        slider_btn = e
+                        break
+                if slider_btn:
+                    sx = (slider_btn.rect[0] + slider_btn.rect[2]) // 2
+                    sy = (slider_btn.rect[1] + slider_btn.rect[3]) // 2
+                else:
+                    sx = slider_text.rect[0] + 115
+                    sy = (slider_text.rect[1] + slider_text.rect[3]) // 2
+                ex = sx + 700
+                print(f"    [OK] 滑块验证，拖动 ({sx},{sy}) → ({ex},{sy})")
+                _swipe_slider(sx, sy, ex, sy)
+                time.sleep(2)
+                handled = True
+
+            checkbox = (
+                find_with_multiple_conditions(
+                    res_id="checkbox", exact_match=False,
+                    elements=elems_now, device_id=DEVICE_ID
+                )
+                or find_with_multiple_conditions(
+                    res_id="miui.packageinstaller:id/checkbox", exact_match=False,
+                    elements=elems_now, device_id=DEVICE_ID
+                )
+                or find_with_multiple_conditions(
+                    res_id="android:id/checkbox", exact_match=False,
+                    elements=elems_now, device_id=DEVICE_ID
+                )
+                or find_with_multiple_conditions(
+                    class_name="CheckBox", checkable=True,
+                    elements=elems_now, device_id=DEVICE_ID
+                )
+            )
+            if checkbox:
+                print("    [OK] 勾选「已了解此安装包未经安全检测」")
+                _tap_elem(checkbox)
+                time.sleep(0.3)
+                handled = True
+
+            install_btn = (
+                find_with_multiple_conditions(
+                    text="完成", clickable=True, exact_match=False,
+                    elements=elems_now, device_id=DEVICE_ID
+                )
+                or find_with_multiple_conditions(
+                    text="完成", exact_match=False,
+                    elements=elems_now, device_id=DEVICE_ID
+                )
+                or find_with_multiple_conditions(
+                    text="继续安装", clickable=True, exact_match=False,
+                    elements=elems_now, device_id=DEVICE_ID
+                )
+                or find_with_multiple_conditions(
+                    text="继续安装", exact_match=False,
+                    elements=elems_now, device_id=DEVICE_ID
+                )
+                or find_with_multiple_conditions(
+                    text="安装", clickable=True, exact_match=False,
+                    elements=elems_now, device_id=DEVICE_ID
+                )
+                or find_with_multiple_conditions(
+                    text="确定", clickable=True, exact_match=False,
+                    elements=elems_now, device_id=DEVICE_ID
+                )
+            )
+            if install_btn and install_btn.rect[3] > 2000:
+                btn_text = install_btn.text or ""
+                print(f"    [OK] 点击「{btn_text}」")
+                _tap_elem(install_btn)
+                time.sleep(1)
+                if "完成" in btn_text:
+                    installed = True
+                    print("    [OK] 安装完成！")
+                    break
+                handled = True
+
+            home_tab = find_element_by_id(
+                "com.taptap:id/tb_layout_home_bottom_bar", elems_now
+            )
+            if home_tab:
+                installed = True
+                print("    [OK] 安装完成，已回到 TapTap 主页")
+                break
+
+            if not handled:
+                time.sleep(1.5)
+        if not installed:
+            print("    [WARN] 安装最终未确认完成，继续尝试启动游戏...")
+
+    # ---- 第 19 步：启动游戏 ----
+    _log("\n[19] 启动游戏并等待...")
+    game_package = "com.zhixing.wdxxsg"  # 我的休闲时光包名
+    adb_cmd("shell", "monkey", "-p", game_package, "-c", "android.intent.category.LAUNCHER", "1")
+    _log(f"    [OK] 已启动 {game_package}，等待 10 秒...")
+    time.sleep(10)
+    _log("    [OK] 等待结束")
+
+    _log("\n" + "=" * 60)
+    _log("全部流程完成！")
+    _log("=" * 60)
+
+    monitor.stop()
+    _close_log()
+
+
+if __name__ == "__main__":
+    main()

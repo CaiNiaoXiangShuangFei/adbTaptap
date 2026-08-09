@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADB 设备管理器</title>
+<style>
+  :root {
+    --bg: #0f172a; --card: #1e293b; --card2: #243349;
+    --line: #334155; --text: #e2e8f0; --muted: #94a3b8;
+    --green: #22c55e; --red: #ef4444; --amber: #f59e0b;
+    --blue: #3b82f6; --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh; padding-bottom: 48px;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 24px; border-bottom: 1px solid var(--line);
+    background: rgba(15, 23, 42, .8); position: sticky; top: 0; z-index: 10;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; font-size: 18px; font-weight: 600; }
+  .brand .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .head-actions { display: flex; align-items: center; gap: 12px; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .btn {
+    border: 1px solid var(--line); background: var(--card2); color: var(--text);
+    padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 14px;
+    transition: all .15s;
+  }
+  .btn:hover { border-color: var(--blue); }
+  .btn.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  .btn.primary:hover { filter: brightness(1.1); }
+  .btn.danger { color: var(--red); border-color: var(--red); }
+  .btn.danger:hover { background: rgba(239, 68, 68, .12); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+  main { max-width: 1200px; margin: 24px auto 0; padding: 0 24px; }
+
+  /* 连接面板 */
+  .connect-card {
+    background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 20px; margin-bottom: 24px;
+  }
+  .connect-card h2 { font-size: 15px; margin-bottom: 14px; }
+  .connect-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .connect-row input {
+    flex: 1; min-width: 260px; background: var(--bg); border: 1px solid var(--line);
+    color: var(--text); padding: 9px 12px; border-radius: 8px; font-size: 14px; outline: none;
+  }
+  .connect-row input:focus { border-color: var(--blue); }
+  .connect-hint { margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .task-select {
+    flex: 1; min-width: 260px; background: var(--bg); border: 1px solid var(--line);
+    color: var(--text); padding: 9px 12px; border-radius: 8px; font-size: 14px; outline: none;
+  }
+  .task-select:focus { border-color: var(--blue); }
+  .task-status { margin-top: 10px; display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+  .task-log {
+    margin-top: 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px; height: 220px; overflow: auto; font-family: Consolas, monospace; font-size: 12px;
+    line-height: 1.6; white-space: pre-wrap; word-break: break-all; color: var(--text);
+  }
+  .pair-form { display: grid; grid-template-columns: 1fr 150px 1fr auto; gap: 10px; margin-top: 12px; }
+  .pair-form input {
+    background: var(--bg); border: 1px solid var(--line); color: var(--text);
+    padding: 9px 12px; border-radius: 8px; font-size: 14px; outline: none;
+  }
+  .pair-form input:focus { border-color: var(--blue); }
+  @media (max-width: 900px) { .pair-form { grid-template-columns: 1fr; } }
+  details { margin-top: 12px; font-size: 13px; }
+  summary { cursor: pointer; color: var(--blue); user-select: none; }
+  .guide { margin: 8px 0 0 6px; padding-left: 14px; border-left: 2px solid var(--line); color: var(--muted); line-height: 1.9; }
+  .guide code { background: var(--card2); padding: 1px 6px; border-radius: 4px; color: var(--text); }
+
+  /* 设备卡片 */
+  .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+  .section-head h2 { font-size: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 16px; display: flex; flex-direction: column; gap: 10px;
+  }
+  .card-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .card-title { font-size: 16px; font-weight: 600; word-break: break-all; }
+  .badges { display: flex; gap: 6px; flex-wrap: wrap; }
+  .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .badge.online { color: var(--green); border-color: var(--green); background: rgba(34,197,94,.08); }
+  .badge.offline { color: var(--red); border-color: var(--red); background: rgba(239,68,68,.08); }
+  .badge.unauthorized { color: var(--amber); border-color: var(--amber); background: rgba(245,158,11,.08); }
+  .serial {
+    font-family: Consolas, monospace; font-size: 12px; color: var(--muted);
+    background: var(--bg); padding: 6px 10px; border-radius: 6px; word-break: break-all;
+  }
+  .meta { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; }
+  .meta dt { color: var(--muted); }
+  .meta dd { color: var(--text); word-break: break-all; }
+  .actions { display: flex; gap: 8px; margin-top: auto; flex-wrap: wrap; }
+  .actions .btn { font-size: 13px; padding: 6px 12px; }
+  .empty {
+    grid-column: 1 / -1; text-align: center; color: var(--muted);
+    padding: 48px 0; border: 1px dashed var(--line); border-radius: var(--radius);
+  }
+
+  /* 截图弹窗 */
+  .modal {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,.82);
+    z-index: 100; align-items: center; justify-content: center; padding: 24px; flex-direction: column;
+  }
+  .modal.show { display: flex; }
+  .modal img { max-width: 92vw; max-height: 82vh; border-radius: 8px; box-shadow: 0 8px 40px rgba(0,0,0,.6); }
+  .modal .m-title { margin-top: 12px; font-size: 13px; color: var(--muted); }
+  .modal .close { position: absolute; top: 18px; right: 24px; font-size: 28px; cursor: pointer; color: var(--muted); }
+  .modal .close:hover { color: #fff; }
+
+  /* 实时预览 */
+  .pv-head { display: flex; align-items: center; gap: 12px; width: 100%; max-width: 700px; margin-bottom: 10px; font-size: 14px; }
+  .pv-head select {
+    background: var(--card2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 3px 6px; font-size: 13px;
+  }
+  .pv-stage { display: flex; justify-content: center; }
+  .pv-stage img {
+    max-width: 92vw; max-height: 68vh; border-radius: 8px; background: #000;
+    box-shadow: 0 8px 40px rgba(0,0,0,.6); cursor: crosshair; user-select: none; -webkit-user-drag: none;
+  }
+  .pv-hint { margin-top: 8px; font-size: 12px; }
+  .pv-bar { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; justify-content: center; }
+  .pv-bar .btn { font-size: 13px; padding: 6px 14px; }
+
+  /* 提示 */
+  .toast-wrap { position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 200; }
+  .toast {
+    background: var(--card2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 16px; font-size: 13px; max-width: 360px; box-shadow: 0 4px 16px rgba(0,0,0,.4);
+    animation: slideIn .2s ease;
+  }
+  .toast.ok { border-color: var(--green); }
+  .toast.err { border-color: var(--red); }
+  @keyframes slideIn { from { transform: translateY(12px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+  @media (max-width: 640px) {
+    .brand span:last-child { display: none; }
+    main { padding: 0 14px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span class="dot"></span>
+    <span>ADB 设备管理器</span>
+  </div>
+  <div class="head-actions">
+    <span class="muted" id="lastRefresh">尚未刷新</span>
+    <label class="muted" style="display:flex;align-items:center;gap:4px;">
+      <input type="checkbox" id="autoRefresh" checked> 自动刷新
+    </label>
+    <button class="btn" id="btnRefresh">刷新</button>
+  </div>
+</header>
+
+<main>
+  <!-- 连接新设备 -->
+  <div class="connect-card">
+    <h2>连接新设备</h2>
+    <div class="connect-row">
+      <input id="ipInput" placeholder="输入手机 IP 或 IP:端口，如 192.168.31.100 或 192.168.31.100:5555"
+             autocomplete="off" spellcheck="false">
+      <button class="btn primary" id="btnConnect">连接</button>
+    </div>
+    <div class="connect-hint">未填写端口时默认使用 5555。连接后设备会自动出现在下方列表。</div>
+    <details>
+      <summary>如何开启无线调试？</summary>
+      <div class="guide">
+        <b>方式一（手机端开启，Android 11+ 需先配对）：</b><br>
+        ① 手机进入「设置 → 关于手机」连点版本号开启开发者模式；<br>
+        ② 进入「设置 → 开发者选项」，开启「USB 调试」和「无线调试」；<br>
+        ③ Android 11+ 第一次连接需先配对：在「无线调试 → 使用配对码配对设备」里
+        记下配对地址和 6 位配对码，用下方「配对设备」完成配对；<br>
+        ④ 配对后在「无线调试」详情页查看「IP地址和端口」（如 192.168.31.100:37145），填入上方输入框连接。<br>
+        <b>方式二（USB 线连接后自动开启）：</b><br>
+        用数据线连接手机，等它出现在列表后，点击设备上的「开启无线调试」按钮，
+        再点击「无线连接」自动填入地址连接，之后可拔掉数据线。<br>
+        <b>注意：</b>手机和电脑需在同一局域网内。
+      </div>
+    </details>
+
+    <!-- 配对（Android 11+ 无线调试） -->
+    <details>
+      <summary>Android 11+ 设备需要配对？点此配对</summary>
+      <div class="guide">
+        手机进入「开发者选项 → 无线调试 → 使用配对码配对设备」，将显示的
+        <b>配对地址（IP:端口）</b>和 <b>6 位配对码</b>填入下方，再填「连接地址」
+        （无线调试主页显示的 IP地址和端口，可稍后填写）。配对码每次打开配对页都会刷新，且约 1 分钟失效。
+      </div>
+      <div class="pair-form">
+        <input id="pairAddr" placeholder="配对地址（IP:端口）" autocomplete="off" spellcheck="false">
+        <input id="pairCode" placeholder="6 位配对码" autocomplete="off" spellcheck="false">
+        <input id="connAddr" placeholder="连接地址（可选，如 192.168.1.112:38011）" autocomplete="off" spellcheck="false">
+        <button class="btn primary" id="btnPair">配对并连接</button>
+      </div>
+    </details>
+  </div>
+
+  <!-- 自动化任务 -->
+  <div class="connect-card">
+    <h2>自动化任务</h2>
+    <div class="connect-row">
+      <select id="taskDevice" class="task-select" title="选择目标设备"></select>
+      <button class="btn primary" id="btnRunTask">运行 TapTap 自动登录</button>
+      <button class="btn danger" id="btnStopTask" disabled>停止</button>
+      <button class="btn" id="btnClearLog">清空日志</button>
+    </div>
+    <div class="task-status" id="taskStatus"></div>
+    <pre class="task-log" id="taskLog" placeholder="任务日志将在此实时显示…"></pre>
+  </div>
+
+  <!-- 设备列表 -->
+  <div class="section-head">
+    <h2>已连接设备 <span class="muted" id="deviceCount"></span></h2>
+  </div>
+  <div class="grid" id="deviceGrid"></div>
+</main>
+
+<!-- 截图弹窗 -->
+<div class="modal" id="modal">
+  <span class="close" onclick="closeModal()">&times;</span>
+  <img id="modalImg" alt="screenshot">
+  <div class="m-title" id="modalTitle"></div>
+</div>
+
+<!-- 实时预览弹窗 -->
+<div class="modal" id="pvModal">
+  <span class="close" onclick="closePreview()">&times;</span>
+  <div class="pv-head">
+    <b id="pvTitle"></b>
+    <select id="pvInterval" title="刷新间隔">
+      <option value="500">0.5 秒</option>
+      <option value="1000" selected>1 秒</option>
+      <option value="2000">2 秒</option>
+    </select>
+    <span class="muted" id="pvStatus"></span>
+  </div>
+  <div class="pv-stage">
+    <img id="pvImg" alt="live preview" draggable="false">
+  </div>
+  <div class="pv-hint muted">点击屏幕=点按；按住拖动=滑动</div>
+  <div class="pv-bar">
+    <button class="btn" onclick="sendKey(3)">主页</button>
+    <button class="btn" onclick="sendKey(4)">返回</button>
+    <button class="btn" onclick="sendKey(187)">最近任务</button>
+    <button class="btn" onclick="saveSnapshot()">保存截图</button>
+    <button class="btn danger" onclick="closePreview()">停止预览</button>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<script>
+"use strict";
+
+const grid = document.getElementById("deviceGrid");
+const ipInput = document.getElementById("ipInput");
+const lastRefresh = document.getElementById("lastRefresh");
+const deviceCount = document.getElementById("deviceCount");
+
+// ---------- 设备列表 ----------
+async function loadDevices() {
+  try {
+    const res = await fetch("/api/devices");
+    const data = await res.json();
+    render(data.devices || []);
+    updateTaskDevices(data.devices || []);
+    lastRefresh.textContent = "最后刷新 " + new Date().toLocaleTimeString();
+  } catch (e) {
+    toast("刷新失败：" + e.message, "err");
+  }
+}
+
+function updateTaskDevices(devices) {
+  const sel = document.getElementById("taskDevice");
+  const online = devices.filter(d => d.state === "device");
+  const cur = sel.value;
+  sel.innerHTML = online.map(d =>
+    '<option value="' + esc(d.serial) + '">' + esc(d.model || d.brand || d.serial) + " · " + esc(d.serial) + "</option>"
+  ).join("") || '<option value="">无在线设备</option>';
+  if (online.some(d => d.serial === cur)) sel.value = cur;
+  document.getElementById("btnRunTask").disabled = !online.length;
+}
+
+function render(devices) {
+  deviceCount.textContent = "(" + devices.length + ")";
+  if (!devices.length) {
+    grid.innerHTML = '<div class="empty">暂无设备<br><br>请通过 USB 连接手机，或在上方输入 IP:端口 连接无线设备</div>';
+    return;
+  }
+  grid.innerHTML = devices.map(dev => cardHtml(dev)).join("");
+}
+
+function stateBadge(state) {
+  if (state === "device") return '<span class="badge online">在线</span>';
+  if (state === "offline") return '<span class="badge offline">离线</span>';
+  if (state === "unauthorized") return '<span class="badge unauthorized">未授权</span>';
+  return '<span class="badge">' + state + "</span>";
+}
+
+function cardHtml(d) {
+  const online = d.state === "device";
+  const title = d.model || d.brand || "Android 设备";
+  const rows = [];
+  const addRow = (k, v) => { if (v) rows.push("<dt>" + k + "</dt><dd>" + esc(v) + "</dd>"); };
+  if (d.brand) addRow("品牌", d.brand);
+  addRow("Android", d.android ? "Android " + d.android : "");
+  addRow("分辨率", d.resolution);
+  addRow("电量", d.battery);
+  addRow("IP", d.ip);
+
+  let actions = "";
+  if (online) {
+    actions += '<button class="btn" data-act="preview" data-serial="' + esc(d.serial) + '">实时预览</button>';
+    actions += '<button class="btn" data-act="shot" data-serial="' + esc(d.serial) + '">截图</button>';
+    if (d.type === "USB") {
+      actions += '<button class="btn" data-act="tcpip" data-serial="' + esc(d.serial) + '">开启无线调试</button>';
+      if (d.ip) {
+        actions += '<button class="btn" data-act="wifi" data-serial="' + esc(d.serial) + '" data-ip="' + esc(d.ip) + '">无线连接</button>';
+      }
+    } else {
+      actions += '<button class="btn danger" data-act="disc" data-serial="' + esc(d.serial) + '">断开连接</button>';
+    }
+  } else {
+    // 离线/未授权设备：允许从列表中断开清理
+    actions += '<button class="btn danger" data-act="disc" data-serial="' + esc(d.serial) + '">断开连接</button>';
+  }
+
+  return `
+    <div class="card">
+      <div class="card-top">
+        <div class="card-title">${esc(title)}</div>
+        <div class="badges">${stateBadge(d.state)}<span class="badge">${d.type}</span></div>
+      </div>
+      <div class="serial">${esc(d.serial)}</div>
+      ${rows.length ? '<dl class="meta">' + rows.join("") + "</dl>" : ""}
+      ${actions ? '<div class="actions">' + actions + "</div>" : ""}
+    </div>`;
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+// ---------- 操作 ----------
+async function tryConnect(address) {
+  try {
+    const res = await fetch("/api/connect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ address })
+    });
+    const data = await res.json();
+    toast((data.ok ? "✓ " : "✗ ") + data.message, data.ok ? "ok" : "err");
+    return data.ok;
+  } catch (e) {
+    toast("连接失败：" + e.message, "err");
+    return false;
+  }
+}
+
+async function doConnect() {
+  const address = ipInput.value.trim();
+  if (!address) { toast("请输入 IP 地址", "err"); return; }
+  const btn = document.getElementById("btnConnect");
+  btn.disabled = true;
+  try {
+    const ok = await tryConnect(address);
+    if (ok) ipInput.value = "";
+    setTimeout(loadDevices, 500);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function doPair() {
+  const address = document.getElementById("pairAddr").value.trim();
+  const code = document.getElementById("pairCode").value.trim();
+  const conn = document.getElementById("connAddr").value.trim();
+  if (!address || !code) { toast("请填写配对地址和配对码", "err"); return; }
+  const btn = document.getElementById("btnPair");
+  btn.disabled = true;
+  try {
+    const res = await fetch("/api/pair", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ address, code })
+    });
+    const data = await res.json();
+    toast((data.ok ? "✓ " : "✗ ") + data.message, data.ok ? "ok" : "err");
+    if (data.ok) {
+      document.getElementById("pairCode").value = "";
+      if (conn) {
+        await tryConnect(conn);
+      } else {
+        toast("配对成功，请在「无线调试」页查看 IP地址和端口，填到上方输入框连接", "ok");
+      }
+      setTimeout(loadDevices, 800);
+    }
+  } catch (e) {
+    toast("配对失败：" + e.message, "err");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function doDisconnect(serial) {
+  if (!confirm("确定断开 " + serial + " 吗？")) return;
+  try {
+    const res = await fetch("/api/disconnect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ address: serial })
+    });
+    const data = await res.json();
+    toast(data.message, "ok");
+    setTimeout(loadDevices, 500);
+  } catch (e) {
+    toast("操作失败：" + e.message, "err");
+  }
+}
+
+async function doTcpip(serial) {
+  try {
+    const res = await fetch("/api/tcpip", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ serial })
+    });
+    const data = await res.json();
+    toast(data.message, "ok");
+    setTimeout(loadDevices, 1500);
+  } catch (e) {
+    toast("操作失败：" + e.message, "err");
+  }
+}
+
+function connectAddress(addr) {
+  ipInput.value = addr;
+  toast("已填入地址，点击「连接」即可", "ok");
+}
+
+// ---------- 截图 ----------
+function showScreenshot(serial) {
+  const img = document.getElementById("modalImg");
+  img.src = "/api/devices/" + encodeURIComponent(serial) + "/screenshot?t=" + Date.now();
+  document.getElementById("modalTitle").textContent = serial;
+  document.getElementById("modal").classList.add("show");
+}
+function closeModal() { document.getElementById("modal").classList.remove("show"); }
+document.getElementById("modal").addEventListener("click", e => {
+  if (e.target.id === "modal") closeModal();
+});
+
+// ---------- 实时预览 ----------
+let streamSerial = null;
+let streamOn = false;
+let streamTimer = null;
+let streamInterval = 1000;
+let dragStart = null;
+
+function openPreview(serial) {
+  streamSerial = serial;
+  streamOn = true;
+  streamInterval = parseInt(document.getElementById("pvInterval").value, 10) || 1000;
+  document.getElementById("pvTitle").textContent = serial;
+  document.getElementById("pvStatus").textContent = "正在连接…";
+  document.getElementById("pvModal").classList.add("show");
+  streamTick();
+}
+
+function closePreview() {
+  streamOn = false;
+  clearTimeout(streamTimer);
+  streamSerial = null;
+  document.getElementById("pvModal").classList.remove("show");
+}
+
+async function streamTick() {
+  if (!streamOn) return;
+  const img = document.getElementById("pvImg");
+  try {
+    const res = await fetch("/api/devices/" + encodeURIComponent(streamSerial) + "/screenshot?t=" + Date.now());
+    if (!res.ok) throw new Error("截图失败，设备可能离线");
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const prev = img.src;
+    img.onload = () => { if (prev.startsWith("blob:")) URL.revokeObjectURL(prev); };
+    img.src = url;
+    document.getElementById("pvStatus").textContent = "实时预览中";
+  } catch (e) {
+    document.getElementById("pvStatus").textContent = "预览已停止：" + e.message;
+    closePreview();
+  }
+  if (streamOn) streamTimer = setTimeout(streamTick, streamInterval);
+}
+
+async function apiPost(url, body) {
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {})
+    });
+    const data = await res.json();
+    if (data && data.message && !data.ok) toast(data.message, "err");
+  } catch (e) {
+    toast("操作失败：" + e.message, "err");
+  }
+}
+
+function previewSend(url, body) {
+  apiPost(url, body);
+}
+
+const pvImg = document.getElementById("pvImg");
+pvImg.addEventListener("mousedown", e => {
+  dragStart = { x: e.clientX, y: e.clientY };
+});
+pvImg.addEventListener("mouseup", e => {
+  if (!dragStart || !streamSerial) return;
+  const rect = pvImg.getBoundingClientRect();
+  const sx = pvImg.naturalWidth / rect.width;
+  const sy = pvImg.naturalHeight / rect.height;
+  const dx = e.clientX - dragStart.x;
+  const dy = e.clientY - dragStart.y;
+  const base = "/api/devices/" + encodeURIComponent(streamSerial) + "/";
+  if (Math.abs(dx) < 10 && Math.abs(dy) < 10) {
+    const x = Math.round((e.clientX - rect.left) * sx);
+    const y = Math.round((e.clientY - rect.top) * sy);
+    previewSend(base + "tap", { x, y });
+  } else {
+    previewSend(base + "swipe", {
+      x1: Math.round((dragStart.x - rect.left) * sx),
+      y1: Math.round((dragStart.y - rect.top) * sy),
+      x2: Math.round((e.clientX - rect.left) * sx),
+      y2: Math.round((e.clientY - rect.top) * sy),
+      duration: 300
+    });
+  }
+  dragStart = null;
+});
+
+function sendKey(key) {
+  if (streamSerial) previewSend("/api/devices/" + encodeURIComponent(streamSerial) + "/key", { key });
+}
+
+function saveSnapshot() {
+  const img = document.getElementById("pvImg");
+  if (!img || !img.src) return;
+  const a = document.createElement("a");
+  a.href = img.src;
+  a.download = "screen_" + (streamSerial || "device").replace(/[^a-zA-Z0-9_.-]/g, "_") + ".png";
+  a.click();
+}
+
+document.getElementById("pvInterval").addEventListener("change", e => {
+  streamInterval = parseInt(e.target.value, 10) || 1000;
+});
+document.getElementById("pvModal").addEventListener("click", e => {
+  if (e.target.id === "pvModal") closePreview();
+});
+document.addEventListener("keydown", e => {
+  if (e.key !== "Escape") return;
+  if (document.getElementById("pvModal").classList.contains("show")) closePreview();
+  else closeModal();
+});
+
+// ---------- 自动化任务 ----------
+let taskId = null;
+let taskOffset = 0;
+let taskTimer = null;
+
+async function runTask() {
+  const serial = document.getElementById("taskDevice").value;
+  if (!serial) { toast("请选择在线设备", "err"); return; }
+  const btn = document.getElementById("btnRunTask");
+  btn.disabled = true;
+  try {
+    const res = await fetch("/api/task/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ serial })
+    });
+    const data = await res.json();
+    toast((data.ok ? "✓ " : "✗ ") + data.message, data.ok ? "ok" : "err");
+    if (data.ok) {
+      taskId = data.id;
+      taskOffset = 0;
+      document.getElementById("taskLog").textContent = "";
+      setTaskStatus("running", "", serial);
+      pollTask();
+    } else {
+      btn.disabled = false;
+    }
+  } catch (e) {
+    toast("启动失败：" + e.message, "err");
+    btn.disabled = false;
+  }
+}
+
+async function pollTask() {
+  try {
+    const res = await fetch("/api/task?offset=" + taskOffset);
+    const data = await res.json();
+    if (!data.task) {
+      if (taskId) { taskId = null; setTaskStatus(null); }
+      return;
+    }
+    const t = data.task;
+    if (t.id !== taskId) { taskId = t.id; taskOffset = 0; }
+    if (t.lines.length) {
+      const box = document.getElementById("taskLog");
+      box.textContent += t.lines.map(l => l + "\n").join("");
+      box.scrollTop = box.scrollHeight;
+      taskOffset = t.total;
+    }
+    if (t.status === "running") {
+      setTaskStatus("running", t.started, t.serial);
+      taskTimer = setTimeout(pollTask, 1000);
+    } else {
+      setTaskStatus(t.status, t.started, t.serial);
+      taskId = null;
+    }
+  } catch (e) {
+    taskTimer = setTimeout(pollTask, 2000);
+  }
+}
+
+function setTaskStatus(status, started, serial) {
+  const el = document.getElementById("taskStatus");
+  const runBtn = document.getElementById("btnRunTask");
+  const stopBtn = document.getElementById("btnStopTask");
+  const hasDevice = !!document.getElementById("taskDevice").value;
+  if (!status) {
+    el.innerHTML = '<span class="badge">空闲</span>';
+    runBtn.disabled = !hasDevice;
+    stopBtn.disabled = true;
+    return;
+  }
+  const map = {
+    running: ['<span class="badge online">运行中</span>', true, false],
+    success: ['<span class="badge online">成功</span>', false, true],
+    error: ['<span class="badge offline">失败</span>', false, true],
+  };
+  const m = map[status] || ['<span class="badge">' + esc(status) + "</span>", false, true];
+  el.innerHTML = m[0] + (started ? " 启动于 " + esc(started) : "") + (serial ? " · " + esc(serial) : "");
+  runBtn.disabled = m[1] || !hasDevice;
+  stopBtn.disabled = m[2];
+}
+
+async function stopTask() {
+  try {
+    const res = await fetch("/api/task/stop", { method: "POST" });
+    const data = await res.json();
+    toast((data.ok ? "✓ " : "✗ ") + data.message, data.ok ? "ok" : "err");
+  } catch (e) {
+    toast("停止失败：" + e.message, "err");
+  }
+}
+
+function clearLog() {
+  document.getElementById("taskLog").textContent = "";
+  taskOffset = 0;
+}
+
+// ---------- 提示 ----------
+function toast(msg, type) {
+  const wrap = document.getElementById("toastWrap");
+  const el = document.createElement("div");
+  el.className = "toast " + (type || "");
+  el.textContent = msg;
+  wrap.appendChild(el);
+  setTimeout(() => { el.style.opacity = "0"; el.style.transition = "opacity .3s"; }, 3200);
+  setTimeout(() => el.remove(), 3600);
+}
+
+// ---------- 初始化 ----------
+document.getElementById("btnConnect").addEventListener("click", doConnect);
+document.getElementById("btnPair").addEventListener("click", doPair);
+document.getElementById("btnRefresh").addEventListener("click", loadDevices);
+ipInput.addEventListener("keydown", e => { if (e.key === "Enter") doConnect(); });
+
+// 自动化任务按钮
+document.getElementById("btnRunTask").addEventListener("click", runTask);
+document.getElementById("btnStopTask").addEventListener("click", stopTask);
+document.getElementById("btnClearLog").addEventListener("click", clearLog);
+
+// 设备卡片按钮（事件委托，避免 onclick 内嵌序列号导致的引号问题）
+grid.addEventListener("click", e => {
+  const btn = e.target.closest("button[data-act]");
+  if (!btn) return;
+  const act = btn.dataset.act;
+  const serial = btn.dataset.serial;
+  if (act === "preview") openPreview(serial);
+  else if (act === "shot") showScreenshot(serial);
+  else if (act === "tcpip") doTcpip(serial);
+  else if (act === "wifi") connectAddress(btn.dataset.ip + ":5555");
+  else if (act === "disc") doDisconnect(serial);
+});
+
+setInterval(() => {
+  if (document.getElementById("autoRefresh").checked) loadDevices();
+}, 4000);
+
+loadDevices();
+</script>
+</body>
+</html>
