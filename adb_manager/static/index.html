@@ -177,7 +177,7 @@
   .modal .close:hover { color: #fff; }
 
   /* 实时预览 */
-  .pv-head { display: flex; align-items: center; gap: 12px; width: 100%; max-width: 700px; margin-bottom: 10px; font-size: 14px; }
+  .pv-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; width: 100%; max-width: 700px; margin-bottom: 10px; font-size: 14px; }
   .pv-head select {
     background: var(--card2); color: var(--text); border: 1px solid var(--line);
     border-radius: 6px; padding: 3px 6px; font-size: 13px;
@@ -189,6 +189,7 @@
     -webkit-user-drag: none; touch-action: none;
   }
   .pv-hint { margin-top: 8px; font-size: 12px; }
+  .pv-latency { min-width: 88px; text-align: center; font-variant-numeric: tabular-nums; }
   .pv-bar { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; justify-content: center; }
   .pv-bar .btn { font-size: 13px; padding: 6px 14px; }
 
@@ -505,10 +506,14 @@
   <div class="pv-head">
     <b id="pvTitle"></b>
     <select id="pvInterval" title="刷新间隔">
-      <option value="500">0.5 秒</option>
-      <option value="1000" selected>1 秒</option>
+      <option value="100">100 ms</option>
+      <option value="200" selected>200 ms</option>
+      <option value="300">300 ms</option>
+      <option value="500">500 ms</option>
+      <option value="1000">1 秒</option>
       <option value="2000">2 秒</option>
     </select>
+    <span class="badge pv-latency" id="pvLatency">延迟 -- ms</span>
     <span class="muted" id="pvStatus"></span>
   </div>
   <div class="pv-stage">
@@ -830,7 +835,7 @@ document.getElementById("modal").addEventListener("click", e => {
 let streamSerial = null;
 let streamOn = false;
 let streamTimer = null;
-let streamInterval = 1000;
+let streamInterval = 200;
 let dragStart = null;
 let streamController = null;
 let streamGeneration = 0;
@@ -842,9 +847,10 @@ function openPreview(serial) {
   streamOn = true;
   streamGeneration++;
   streamFailures = 0;
-  streamInterval = parseInt(document.getElementById("pvInterval").value, 10) || 1000;
+  streamInterval = parseInt(document.getElementById("pvInterval").value, 10) || 200;
   document.getElementById("pvTitle").textContent = serial;
   document.getElementById("pvStatus").textContent = "正在连接…";
+  updatePreviewLatency(null);
   document.getElementById("pvModal").classList.add("show");
   streamTick();
 }
@@ -858,7 +864,22 @@ function closePreview(hide = true) {
   streamSerial = null;
   dragStart = null;
   clearImageBlob(document.getElementById("pvImg"));
+  updatePreviewLatency(null);
   if (hide) document.getElementById("pvModal").classList.remove("show");
+}
+
+function updatePreviewLatency(milliseconds) {
+  const badge = document.getElementById("pvLatency");
+  badge.className = "badge pv-latency";
+  if (!Number.isFinite(milliseconds)) {
+    badge.textContent = "延迟 -- ms";
+    return;
+  }
+  const latency = Math.max(0, Math.round(milliseconds));
+  badge.textContent = "延迟 " + latency + " ms";
+  if (latency <= 250) badge.classList.add("online");
+  else if (latency <= 600) badge.classList.add("unauthorized");
+  else badge.classList.add("offline");
 }
 
 async function streamTick() {
@@ -866,23 +887,32 @@ async function streamTick() {
   const generation = streamGeneration;
   const serial = streamSerial;
   const img = document.getElementById("pvImg");
+  const frameStartedAt = performance.now();
+  let frameDuration = 0;
   streamController = new AbortController();
   try {
     const blob = await fetchScreenshot(serial, streamController.signal);
     if (!streamOn || generation !== streamGeneration) return;
     replaceImageBlob(img, blob);
+    if (typeof img.decode === "function") {
+      try { await img.decode(); } catch (_) {}
+    }
+    if (!streamOn || generation !== streamGeneration) return;
+    frameDuration = performance.now() - frameStartedAt;
     streamFailures = 0;
-    document.getElementById("pvStatus").textContent = "实时预览中";
+    updatePreviewLatency(frameDuration);
+    document.getElementById("pvStatus").textContent = "毫秒级实时预览中 · 目标 " + streamInterval + " ms";
   } catch (e) {
     if (e.name === "AbortError" || !streamOn || generation !== streamGeneration) return;
     streamFailures++;
+    updatePreviewLatency(null);
     document.getElementById("pvStatus").textContent =
       "截图失败，正在重试（" + streamFailures + "）：" + e.message;
   } finally {
     if (generation === streamGeneration) streamController = null;
   }
   if (streamOn && generation === streamGeneration) {
-    const retryDelay = streamFailures ? Math.max(2000, streamInterval) : streamInterval;
+    const retryDelay = streamFailures ? Math.max(2000, streamInterval) : Math.max(0, streamInterval - frameDuration);
     streamTimer = setTimeout(streamTick, retryDelay);
   }
 }
@@ -952,7 +982,10 @@ function saveSnapshot() {
 }
 
 document.getElementById("pvInterval").addEventListener("change", e => {
-  streamInterval = parseInt(e.target.value, 10) || 1000;
+  streamInterval = parseInt(e.target.value, 10) || 200;
+  if (streamOn) {
+    document.getElementById("pvStatus").textContent = "毫秒级实时预览中 · 目标 " + streamInterval + " ms";
+  }
 });
 document.getElementById("pvModal").addEventListener("click", e => {
   if (e.target.id === "pvModal") closePreview();
