@@ -860,12 +860,22 @@ def _input_text_is_present(elements, expected: str) -> bool:
     return False
 
 
+def _input_text_is_exact(elements, expected: str) -> bool:
+    expected_normalized = "".join(expected.split())
+    return any(
+        "EditText" in (elem.class_name or "")
+        and "".join((elem.text or "").split()) == expected_normalized
+        for elem in elements
+    )
+
+
 def input_text_verified(
     input_elem,
     value: str,
     *,
     clear: bool = True,
     verify_transition: bool = False,
+    exact: bool = False,
 ) -> bool:
     """输入普通文本并从 UI 读回验证，不成功则返回 False。"""
     _tap_elem(input_elem)
@@ -900,7 +910,8 @@ def input_text_verified(
         )
         # 验证码正确会自动跳转；仍在原页面表示验证码错误或输入未生效，不再重复输入。
         return transitioned is not None
-    if _input_text_is_present(after_primary_input, value):
+    input_matches = _input_text_is_exact if exact else _input_text_is_present
+    if input_matches(after_primary_input, value):
         return True
 
     # 纯 ASCII 文本可使用系统 input text 作为回退。
@@ -923,7 +934,7 @@ def input_text_verified(
                     timeout=8,
                 )
                 return transitioned is not None
-            if _input_text_is_present(after_fallback_input, value):
+            if input_matches(after_fallback_input, value):
                 return True
     return False
 
@@ -1078,46 +1089,113 @@ def is_search_page(elements) -> bool:
         or any("EditText" in (elem.class_name or "") for elem in elements)
 
 
+def _find_game_search_input(elements):
+    input_elem = _find_element_by_id_candidates(elements, ["input_box"])
+    if input_elem is not None:
+        return input_elem
+    inputs = find_text_input_elements(elements)
+    return inputs[0] if inputs else None
+
+
+def _input_game_text_by_base64(input_elem, game_name: str) -> bool:
+    """通过 ADB Keyboard 的 Base64 广播输入 Unicode 游戏名。"""
+    _tap_elem(input_elem, "聚焦游戏名输入框")
+    time.sleep(CLICK_SETTLE_DELAY)
+    original_ime = None
+    command_succeeded = False
+    try:
+        original_ime = detect_and_set_adb_keyboard(DEVICE_ID)
+        time.sleep(CLICK_SETTLE_DELAY)
+        encoded_text = base64.b64encode(game_name.encode("utf-8")).decode("ascii")
+        result = adb_cmd(
+            "shell",
+            "am",
+            "broadcast",
+            "-a",
+            "ADB_INPUT_B64",
+            "--es",
+            "msg",
+            encoded_text,
+            timeout=8,
+        )
+        command_succeeded = result.returncode == 0
+        time.sleep(0.4)
+    except Exception as exc:
+        print(f"    [WARN] Base64 输入命令失败: {exc}")
+    finally:
+        if original_ime is not None:
+            try:
+                restore_keyboard(original_ime, DEVICE_ID)
+            except Exception:
+                pass
+    return command_succeeded and _input_text_is_exact(
+        get_ui_elements_safe(DEVICE_ID),
+        game_name,
+    )
+
+
 def input_game_search_text(elements, game_name: str) -> bool:
-    """必要时点击清除按钮，随后立即输入并验证游戏名。"""
-    for attempt in range(1, 3):
-        current_elements = elements if attempt == 1 else get_ui_elements_safe(DEVICE_ID)
-        input_elem = _find_element_by_id_candidates(current_elements, ["input_box"])
-        if input_elem is None:
-            inputs = find_text_input_elements(current_elements)
-            input_elem = inputs[0] if inputs else None
-        if input_elem is None:
-            print("    [FAIL] 搜索页面未找到游戏名输入框")
-            return False
-        if _input_text_is_present(current_elements, game_name):
-            return True
+    """分层输入游戏名；输入框展示的旧词可能只是可被直接覆盖的提示词。"""
+    current_elements = elements or get_ui_elements_safe(DEVICE_ID)
+    input_elem = _find_game_search_input(current_elements)
+    if input_elem is None:
+        print("    [FAIL] 搜索页面未找到游戏名输入框")
+        return False
+    if _input_text_is_exact(current_elements, game_name):
+        return True
 
-        clear_with_keyboard = bool((input_elem.text or "").strip())
-        clear_button = _find_element_by_id_candidates(current_elements, ["clear_input"])
-        if clear_button is not None:
-            print(f"    [ACTION] 清除历史搜索词: {input_elem.text or '-'}")
-            _tap_elem(clear_button, "清除历史搜索词")
-            clear_with_keyboard = False
-        elif clear_with_keyboard:
-            # 部分 TapTap 版本没有输入框清除按钮，通用 clear_text 对该控件不生效。
-            # 输入框已聚焦时移动到末尾并逐字退格，随后立即输入，不等待空文本回读。
-            _tap_elem(input_elem, "聚焦游戏名输入框")
-            delete_count = max(len((input_elem.text or "").strip()), 1)
-            clear_result = adb_cmd(
-                "shell",
-                "input",
-                "keyevent",
-                "123",  # KEYCODE_MOVE_END
-                *(["67"] * delete_count),  # KEYCODE_DEL
-                timeout=8,
-            )
-            clear_with_keyboard = clear_result.returncode != 0
+    print("    [INPUT-1] 直接覆盖输入游戏名...")
+    if input_text_verified(input_elem, game_name, clear=False, exact=True):
+        print(f"    [OK] 游戏名已直接输入并验证: {game_name}")
+        return True
 
-        if input_text_verified(input_elem, game_name, clear=clear_with_keyboard):
-            print(f"    [OK] 游戏名已输入并验证: {game_name}")
-            return True
-        if attempt < 2:
-            print("    [WARN] 游戏名未能读回确认，重新清空并输入...")
+    current_elements = get_ui_elements_safe(DEVICE_ID)
+    input_elem = _find_game_search_input(current_elements)
+    if input_elem is None:
+        return False
+    print("    [INPUT-2] 使用 Base64 Unicode 广播输入...")
+    if _input_game_text_by_base64(input_elem, game_name):
+        print(f"    [OK] Base64 方式已输入游戏名: {game_name}")
+        return True
+
+    current_elements = get_ui_elements_safe(DEVICE_ID)
+    input_elem = _find_game_search_input(current_elements)
+    if input_elem is None:
+        return False
+    print("    [INPUT-3] 清理输入框后重新输入...")
+    clear_button = _find_element_by_id_candidates(current_elements, ["clear_input"])
+    if clear_button is not None:
+        _tap_elem(clear_button, "清除搜索输入")
+    if input_text_verified(
+        input_elem,
+        game_name,
+        clear=clear_button is None,
+        exact=True,
+    ):
+        print(f"    [OK] 清理后已输入游戏名: {game_name}")
+        return True
+
+    current_elements = get_ui_elements_safe(DEVICE_ID)
+    input_elem = _find_game_search_input(current_elements)
+    if input_elem is None:
+        return False
+    print("    [INPUT-4] 使用按键清理并进行最终 Unicode 输入...")
+    _tap_elem(input_elem, "聚焦游戏名输入框")
+    visible_length = len((input_elem.text or "").strip())
+    delete_count = max(visible_length, len(game_name), 1) + 2
+    adb_cmd(
+        "shell",
+        "input",
+        "keyevent",
+        "123",  # KEYCODE_MOVE_END
+        *(["67"] * delete_count),  # KEYCODE_DEL
+        timeout=8,
+    )
+    if _input_game_text_by_base64(input_elem, game_name):
+        print(f"    [OK] 最终输入方式已写入游戏名: {game_name}")
+        return True
+
+    print("    [FAIL] 四种输入方式均未能写入目标游戏名")
     return False
 
 
