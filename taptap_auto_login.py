@@ -188,79 +188,124 @@ def _extract_ip(device_id: str) -> str:
 
 # 保存最初配置的端口，用于重连时尝试
 _CONFIGURED_PORT = DEVICE_ID.split(":")[1] if ":" in DEVICE_ID else "5555"
+_UI_DUMP_LOCK = threading.Lock()
+_RECONNECT_LOCK = threading.Lock()
+_LAST_FOREGROUND_UI_ACTIVITY = 0.0
+
+
+def _is_device_online(device_id: str, attempts: int = 2) -> bool:
+    """只检查设备状态，不触发 adb connect。"""
+    for attempt in range(attempts):
+        try:
+            check = subprocess.run(
+                [_ADB_PATH, "-s", device_id, "get-state"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                errors="replace",
+            )
+            if check.returncode == 0 and check.stdout.strip() == "device":
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if attempt + 1 < attempts:
+            time.sleep(0.2)
+    return False
 
 
 def ensure_device_connected() -> bool:
     """检查设备是否在线，不在线则尝试重连（自动尝试多个端口）。"""
     global DEVICE_ID
+    with _RECONNECT_LOCK:
+        # UI dump 的瞬时失败不代表设备离线；在线时绝不重复 connect。
+        if _is_device_online(DEVICE_ID):
+            return True
 
-    # USB 设备没有可供 adb connect 使用的网络端口，只检查当前状态。
-    if ":" not in DEVICE_ID:
-        try:
-            check = adb_cmd("get-state", timeout=3)
-            return check.returncode == 0 and check.stdout.strip() == "device"
-        except (OSError, subprocess.SubprocessError):
+        # USB 设备没有可供 adb connect 使用的网络端口。
+        if ":" not in DEVICE_ID:
             return False
 
-    ip = _extract_ip(DEVICE_ID)
-    # 按优先级尝试多个端口：当前端口 -> 5555（tcpip模式）
-    ports_to_try = [_CONFIGURED_PORT, "5555"]
-    # 去重但保持顺序
-    seen = set()
-    ports = []
-    for p in ports_to_try:
-        if p not in seen:
-            seen.add(p)
-            ports.append(p)
+        ip = _extract_ip(DEVICE_ID)
+        current_port = DEVICE_ID.split(":", 1)[1]
+        ports_to_try = [current_port, _CONFIGURED_PORT, "5555"]
+        ports = list(dict.fromkeys(ports_to_try))
 
-    for port in ports:
-        target = f"{ip}:{port}"
-        for attempt in range(3):
-            try:
-                subprocess.run(
-                    [_ADB_PATH, "connect", target],
-                    capture_output=True, text=True, timeout=5, errors="replace"
-                )
-            except (OSError, subprocess.SubprocessError) as exc:
-                print(f"    [WARN] adb 重连命令执行失败: {exc}")
-                return False
-            time.sleep(0.5)
-            try:
-                check = subprocess.run(
-                    [_ADB_PATH, "-s", target, "get-state"],
-                    capture_output=True, text=True, timeout=3, errors="replace"
-                )
-            except (OSError, subprocess.SubprocessError):
-                check = None
-            if check and check.returncode == 0 and check.stdout.strip() == "device":
-                # 重连成功后更新 DEVICE_ID
-                if DEVICE_ID != target:
-                    DEVICE_ID = target
-                    print(f"    [OK] 端口已更新: {target}")
-                return True
-            if attempt < 2:
-                print(f"    [WARN] {target} 连接失败，重试中...")
-                time.sleep(2)
-        print(f"    [WARN] 端口 {port} 不可用，尝试下一个...")
-    return False
+        for port in ports:
+            target = f"{ip}:{port}"
+            for attempt in range(2):
+                try:
+                    subprocess.run(
+                        [_ADB_PATH, "connect", target],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        errors="replace",
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    print(f"    [WARN] adb 重连命令执行失败: {exc}")
+                    return False
 
+                time.sleep(0.4)
+                if _is_device_online(target):
+                    if DEVICE_ID != target:
+                        DEVICE_ID = target
+                        print(f"    [OK] 设备端口已更新: {target}")
+                    else:
+                        print(f"    [OK] 设备已重新连接: {target}")
+                    return True
 
-def get_ui_elements_safe(device_id) -> list:
-    """带重连的 get_ui_elements。"""
-    current_device = device_id
-    for _ in range(3):
-        try:
-            return get_ui_elements(current_device)
-        except RuntimeError as e:
-            if "not found" in str(e).lower():
-                print("    [WARN] 设备断连，尝试重连...")
-                if ensure_device_connected():
-                    # 重连可能切换到了 5555 端口，后续调用必须使用新 serial。
-                    current_device = DEVICE_ID
+                if attempt == 0:
                     time.sleep(1)
-                    continue
-            raise
-    return []
+
+        return False
+
+
+def get_ui_elements_safe(device_id, *, background: bool = False) -> list:
+    """串行获取 UI 层级；仅在设备确实离线时执行重连。"""
+    global _LAST_FOREGROUND_UI_ACTIVITY
+
+    if not background:
+        _LAST_FOREGROUND_UI_ACTIVITY = time.monotonic()
+
+    acquired = _UI_DUMP_LOCK.acquire(blocking=not background)
+    if not acquired:
+        return []
+
+    last_error = None
+    try:
+        current_device = DEVICE_ID
+        for attempt in range(5):
+            try:
+                return get_ui_elements(current_device)
+            except RuntimeError as exc:
+                last_error = exc
+                message = str(exc).lower()
+                recoverable = any(
+                    marker in message
+                    for marker in ("not found", "offline", "no devices")
+                )
+                if not recoverable:
+                    raise
+
+                if _is_device_online(current_device):
+                    # 常见原因是 uiautomator dump 瞬时失败；不要对在线设备 connect。
+                    if not background and attempt == 1:
+                        print("    [WARN] UI 信息获取暂时失败，设备仍在线，正在重试...")
+                else:
+                    if not background:
+                        print("    [WARN] 确认设备已离线，尝试重连...")
+                    if not ensure_device_connected():
+                        if attempt == 4:
+                            raise
+                    current_device = DEVICE_ID
+
+                time.sleep(min(0.3 * (attempt + 1), 1.2))
+
+        if last_error:
+            raise last_error
+        return []
+    finally:
+        _UI_DUMP_LOCK.release()
 
 
 def clear_app_data(package: str) -> bool:
@@ -692,21 +737,26 @@ class PopupMonitor:
         print("    [OK] 弹窗监控已停止")
 
     def _run(self):
-        while not self._stop_event.is_set():
+        # 首次检查也等待一个周期，让主流程先完成启动页处理。
+        while not self._stop_event.wait(self.interval):
             try:
                 self._check_popups()
             except RuntimeError:
                 pass
             except Exception:
                 pass
-            self._stop_event.wait(self.interval)
 
     def _check_popups(self):
+        # 主流程刚执行过 UI 操作时跳过本轮，避免与主流程争抢 uiautomator dump。
+        if time.monotonic() - _LAST_FOREGROUND_UI_ACTIVITY < self.interval:
+            return
+
         # 重连可能更新全局 DEVICE_ID（例如无线调试端口变化）。
         device_id = DEVICE_ID
         self.device_id = device_id
         try:
-            elements = get_ui_elements_safe(device_id)
+            # 后台线程不等待 UI 锁；主流程繁忙时直接留到下一轮。
+            elements = get_ui_elements_safe(device_id, background=True)
         except RuntimeError:
             return
         if not elements:
