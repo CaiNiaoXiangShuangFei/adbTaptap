@@ -126,6 +126,11 @@ def parse_args():
     parser.add_argument("--game", help="要搜索下载的游戏名", default=None)
     parser.add_argument("--game-package", help="目标游戏包名", default=None)
     parser.add_argument(
+        "--capture-screenshot",
+        action="store_true",
+        help="下载后进入“我的游戏”并保存结果截图",
+    )
+    parser.add_argument(
         "--install-and-launch",
         action="store_true",
         help="下载后继续等待安装并启动游戏（网页批量任务默认关闭）",
@@ -2553,16 +2558,23 @@ def main():
     print("    [OK] 下载点击已生效，已检测到下载/安装状态")
 
     if not ARGS.install_and_launch:
-        delay_seconds = random.uniform(1.0, 2.0)
-        print(f"    [INFO] 下载已开始，等待 {delay_seconds:.1f} 秒后返回首页...")
-        time.sleep(delay_seconds)
-        if not navigate_to_my_games():
-            return
-        screenshot_path = save_my_games_screenshot()
-        if not screenshot_path:
-            return
+        screenshot_path = ""
+        if ARGS.capture_screenshot:
+            delay_seconds = random.uniform(1.0, 2.0)
+            print(f"    [INFO] 已启用结果截图，等待 {delay_seconds:.1f} 秒后返回首页...")
+            time.sleep(delay_seconds)
+            if not navigate_to_my_games():
+                return
+            screenshot_path = save_my_games_screenshot()
+            if not screenshot_path:
+                return
+        else:
+            print("    [INFO] 未启用结果截图，下载开始后直接完成当前账号")
         _log("\n" + "=" * 60)
-        _log(f"当前账号流程完成，结果截图: {screenshot_path}")
+        if screenshot_path:
+            _log(f"当前账号流程完成，结果截图: {screenshot_path}")
+        else:
+            _log("当前账号流程完成（未要求截图）")
         _log("=" * 60)
         monitor.stop()
         _WORKFLOW_COMPLETED = True

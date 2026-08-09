@@ -465,6 +465,12 @@
       <div class="config-field">
         <label for="taskGameName">游戏名</label>
         <input class="settings-input" id="taskGameName" value="我的休闲时光" maxlength="100" autocomplete="off" spellcheck="false" placeholder="请输入需要搜索和下载的游戏名">
+        <div class="settings-hint">
+          <label class="device-task-check" for="taskCaptureScreenshot">
+            <input id="taskCaptureScreenshot" type="checkbox">
+            下载后进入“我的游戏”并截图
+          </label>
+        </div>
       </div>
       <div class="config-field">
         <label for="taskCountry">手机号国家/地区</label>
@@ -1242,6 +1248,7 @@ const logTaskIds = new Map();
 async function runTask() {
   const serials = [...selectedDevices];
   const gameName = document.getElementById("taskGameName").value.trim();
+  const captureScreenshot = document.getElementById("taskCaptureScreenshot").checked;
   if (!serials.length) { toast("请至少勾选一台在线设备", "err"); return; }
   if (!gameName) { toast("请输入游戏名", "err"); return; }
   if (!accountQueue.some(account => account.selected && account.status !== "completed")) {
@@ -1254,7 +1261,11 @@ async function runTask() {
     const res = await fetch("/api/task/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ serials, game_name: gameName })
+      body: JSON.stringify({
+        serials,
+        game_name: gameName,
+        capture_screenshot: captureScreenshot,
+      })
     });
     const data = await res.json();
     toast((data.ok ? "✓ " : "✗ ") + data.message, data.ok ? "ok" : "err");
