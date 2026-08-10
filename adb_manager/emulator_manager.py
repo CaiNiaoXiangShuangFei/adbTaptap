@@ -1,4 +1,4 @@
-"""项目内置 Android Emulator 管理器（运行时与 AVD 数据始终避开 C 盘）。"""
+"""项目内置 Android Emulator 管理器（运行时与 AVD 数据默认跟随项目目录）。"""
 
 from __future__ import annotations
 
@@ -16,20 +16,11 @@ import zipfile
 
 
 def _preferred_runtime_dir(project_dir: str) -> str:
-    """Keep emulator payloads off C:, while staying project-local on D:."""
+    """Use an optional override, otherwise keep all payloads inside the project."""
     override = os.environ.get("ADBTAPTAP_RUNTIME_DIR", "").strip()
     if override:
         return os.path.abspath(override)
-    project_dir = os.path.abspath(project_dir)
-    drive = os.path.splitdrive(project_dir)[0].upper()
-    if drive == "D:":
-        return os.path.join(project_dir, "runtime")
-    if os.path.isdir("D:\\"):
-        project_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.basename(project_dir)).strip("._") or "adbTaptap"
-        return os.path.join("D:\\", "adbTaptap-runtime", project_name[:48])
-    if drive == "C:":
-        raise RuntimeError("未检测到 D 盘。为避免写入 C 盘，虚拟安卓运行时不会启动安装")
-    return os.path.join(project_dir, "runtime")
+    return os.path.join(os.path.abspath(project_dir), "runtime")
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))

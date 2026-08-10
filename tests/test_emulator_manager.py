@@ -29,6 +29,15 @@ class EmulatorManagerTests(unittest.TestCase):
             value = os.path.abspath(env[key])
             self.assertEqual(os.path.commonpath([self.project_dir, value]), self.project_dir, key)
 
+    def test_runtime_path_does_not_hardcode_drive(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ADBTAPTAP_RUNTIME_DIR", None)
+            c_project = os.path.normpath(r"C:\Users\tester\adbTaptap")
+            self.assertEqual(
+                emulator_manager._preferred_runtime_dir(c_project),
+                os.path.join(c_project, "runtime"),
+            )
+
     def test_profile_labels_cannot_inject_avd_config(self):
         for path in (
             emulator_manager._exe("emulator", "emulator.exe"),

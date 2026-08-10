@@ -2,7 +2,7 @@
 
 虚拟手机入口位于实时预览窗口右侧的可伸缩面板。第一次使用时点击“安装到项目 runtime”，程序会下载官方 Android Emulator、Android 15 Google APIs 系统镜像和 Temurin JRE 17。
 
-项目位于 D 盘时，所有由本功能创建的文件都在项目的 `runtime` 目录中，包括 SDK、JRE、AVD、缓存、临时文件、用户配置和虚拟手机数据。若项目误放在 C 盘且电脑存在 D 盘，运行时会自动改存到 `D:\adbTaptap-runtime\<项目名>`；若只有 C 盘，安装会被拒绝，避免把运行时写入 C 盘。也可通过 `ADBTAPTAP_RUNTIME_DIR` 指定非 C 盘目录。
+所有由本功能创建的文件默认都保存在项目的 `runtime` 目录中，包括 SDK、JRE、AVD、缓存、临时文件、用户配置和虚拟手机数据，不判断或硬编码盘符。需要把运行时放到其他位置时，可自行通过 `ADBTAPTAP_RUNTIME_DIR` 环境变量指定绝对目录。
 
 项目内的 `runtime` 已加入 `.gitignore`，避免把数 GB 的运行时推送到 GitHub；在另一台电脑上打开管理页面后再次点击安装即可。也可以双击项目根目录的 `install_virtual_android.bat`。
 
@@ -20,6 +20,6 @@
 
 - Windows 10/11 x64。
 - BIOS 已启用 CPU 虚拟化，并启用 Windows Hypervisor Platform 或兼容的虚拟化加速。
-- 首次安装需要稳定网络和约 8–12 GB 的 D 盘可用空间。
+- 首次安装需要稳定网络和约 8–12 GB 的项目所在磁盘可用空间。
 
-如果项目不在 D 盘，运行时会跟随项目目录。要确保文件位于 D 盘，请把整个项目放在 D 盘后再安装。
+运行时默认跟随项目目录：项目放在哪个磁盘，相关文件就保存到哪个磁盘的项目 `runtime` 中。

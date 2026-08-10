@@ -16,7 +16,7 @@ if not exist "%PYTHON_EXE%" (
 
 echo ============================================================
 echo adbTaptap - install project-local Android Emulator runtime
-echo Target: project runtime on D:, otherwise D:\adbTaptap-runtime
+echo Target: %CD%\runtime
 echo ============================================================
 "%PYTHON_EXE%" %PYTHON_ARGS% adb_manager\emulator_manager.py install
 
