@@ -2064,8 +2064,53 @@ def _lan_ip() -> str | None:
         return None
 
 
-def main():
+def _start_adb_server(adb_path: str) -> None:
+    warning = ""
+    try:
+        result = subprocess.run(
+            [adb_path, "start-server"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=15,
+        )
+        if result.returncode != 0:
+            warning = ((result.stdout or "") + (result.stderr or "")).strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        warning = str(exc)
+    if warning:
+        print(
+            f"[WARN] ADB 服务暂时未能启动，Web 管理页面仍会运行并继续自动检测: "
+            f"{warning}",
+            flush=True,
+        )
+
+
+def create_server(
+    host: str = "127.0.0.1",
+    port: int = 0,
+    adb: str | None = None,
+    scrcpy: str | None = None,
+) -> ThreadingHTTPServer:
+    """配置运行时并创建可嵌入桌面应用的本地 HTTP 服务。"""
     global ADB_PATH, SCRCPY_PATH
+    ADB_PATH = find_adb(adb, base_dirs=[PROJECT_DIR])
+    if not ADB_PATH:
+        raise RuntimeError(
+            "找不到 adb。请将 platform-tools 放入项目的 scrcpy、platform-tools "
+            "或 runtime/android-sdk/platform-tools 目录，或通过 --adb/ADB_PATH 指定。"
+        )
+
+    device_toolkit.configure(ADB_PATH, BASE_DIR)
+    emulator_manager.configure(ADB_PATH, PROJECT_DIR)
+    os.environ["PYTHON_EXECUTABLE"] = PYTHON_PATH
+    SCRCPY_PATH = find_scrcpy(scrcpy)
+    http_server = ThreadingHTTPServer((host, port), Handler)
+    threading.Thread(
+        target=_start_adb_server, args=(ADB_PATH,), daemon=True,
+        name="adb-server-start",
+    ).start()
+    return http_server
+
+
+def main():
     parser = argparse.ArgumentParser(description="ADB 设备管理 Web 服务")
     parser.add_argument("--host", default="0.0.0.0", help="监听地址，默认 0.0.0.0（局域网可访问）")
     parser.add_argument("--port", type=int, default=8000, help="监听端口，默认 8000")
@@ -2073,58 +2118,29 @@ def main():
     parser.add_argument("--scrcpy", help="scrcpy 可执行文件或目录；默认自动查找")
     args = parser.parse_args()
 
-    ADB_PATH = find_adb(args.adb, base_dirs=[PROJECT_DIR])
-    if not ADB_PATH:
-        print(
-            "[FAIL] 找不到 adb。请将 platform-tools 放入项目目录、加入 PATH，"
-            "或通过 --adb/ADB_PATH 指定。已检查项目的 scrcpy、platform-tools "
-            "和 runtime/android-sdk/platform-tools 目录。",
-            flush=True,
-        )
-        raise SystemExit(1)
-
-    device_toolkit.configure(ADB_PATH, BASE_DIR)
-    emulator_manager.configure(ADB_PATH, PROJECT_DIR)
-    os.environ["PYTHON_EXECUTABLE"] = PYTHON_PATH
-    SCRCPY_PATH = find_scrcpy(args.scrcpy)
+    try:
+        server = create_server(args.host, args.port, args.adb, args.scrcpy)
+    except (OSError, RuntimeError) as exc:
+        print(f"[FAIL] 服务启动失败: {exc}", flush=True)
+        raise SystemExit(1) from exc
     print(f"[OK] 使用 adb: {ADB_PATH}", flush=True)
     if SCRCPY_PATH:
         print(f"[OK] 本地预览使用 scrcpy: {SCRCPY_PATH}")
     else:
         print("[INFO] 未找到 scrcpy，本地预览将使用内置 ADB 桌面窗口")
+    bound_port = int(server.server_address[1])
     print("[OK] 服务已启动，请在浏览器打开：")
-    print(f"     本机访问:   http://127.0.0.1:{args.port}")
+    print(f"     本机访问:   http://127.0.0.1:{bound_port}")
     ip = _lan_ip()
     if ip:
-        print(f"     局域网访问: http://{ip}:{args.port}")
+        print(f"     局域网访问: http://{ip}:{bound_port}")
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-
-    def start_adb_server():
-        warning = ""
-        try:
-            result = subprocess.run(
-                [ADB_PATH, "start-server"], capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=15,
-            )
-            if result.returncode != 0:
-                warning = ((result.stdout or "") + (result.stderr or "")).strip()
-        except (OSError, subprocess.SubprocessError) as exc:
-            warning = str(exc)
-        if warning:
-            print(
-                f"[WARN] ADB 服务暂时未能启动，Web 管理页面仍会运行并继续自动检测: "
-                f"{warning}",
-                flush=True,
-            )
-
-    threading.Thread(
-        target=start_adb_server, daemon=True, name="adb-server-start",
-    ).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[OK] 服务已停止")
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":
