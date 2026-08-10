@@ -73,6 +73,10 @@ def find_adb(
         seen.add(normalized)
         for candidate in (
             os.path.join(root, "platform-tools"),
+            os.path.join(root, "scrcpy"),
+            os.path.join(root, "runtime", "android-sdk", "platform-tools"),
+            os.path.join(root, "android-sdk", "platform-tools"),
+            os.path.join(root, "tools", "platform-tools"),
             root,
         ):
             found = _resolve_candidate(candidate)

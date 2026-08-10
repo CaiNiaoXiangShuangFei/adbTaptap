@@ -2077,16 +2077,17 @@ def main():
     if not ADB_PATH:
         print(
             "[FAIL] 找不到 adb。请将 platform-tools 放入项目目录、加入 PATH，"
-            "或通过 --adb/ADB_PATH 指定。"
+            "或通过 --adb/ADB_PATH 指定。已检查项目的 scrcpy、platform-tools "
+            "和 runtime/android-sdk/platform-tools 目录。",
+            flush=True,
         )
-        return
+        raise SystemExit(1)
 
-    subprocess.run([ADB_PATH, "start-server"], capture_output=True, timeout=10)
     device_toolkit.configure(ADB_PATH, BASE_DIR)
     emulator_manager.configure(ADB_PATH, PROJECT_DIR)
     os.environ["PYTHON_EXECUTABLE"] = PYTHON_PATH
     SCRCPY_PATH = find_scrcpy(args.scrcpy)
-    print(f"[OK] 使用 adb: {ADB_PATH}")
+    print(f"[OK] 使用 adb: {ADB_PATH}", flush=True)
     if SCRCPY_PATH:
         print(f"[OK] 本地预览使用 scrcpy: {SCRCPY_PATH}")
     else:
@@ -2098,6 +2099,28 @@ def main():
         print(f"     局域网访问: http://{ip}:{args.port}")
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+
+    def start_adb_server():
+        warning = ""
+        try:
+            result = subprocess.run(
+                [ADB_PATH, "start-server"], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=15,
+            )
+            if result.returncode != 0:
+                warning = ((result.stdout or "") + (result.stderr or "")).strip()
+        except (OSError, subprocess.SubprocessError) as exc:
+            warning = str(exc)
+        if warning:
+            print(
+                f"[WARN] ADB 服务暂时未能启动，Web 管理页面仍会运行并继续自动检测: "
+                f"{warning}",
+                flush=True,
+            )
+
+    threading.Thread(
+        target=start_adb_server, daemon=True, name="adb-server-start",
+    ).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
